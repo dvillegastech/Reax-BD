@@ -1,12 +1,27 @@
-# ReaxDB
+# ReaxDB - Open Source Database for Dart & Flutter
 
 [![pub package](https://img.shields.io/pub/v/reaxdb_dart.svg)](https://pub.dev/packages/reaxdb_dart)
-[![GitHub stars](https://img.shields.io/github/stars/dvillegastech/ReaxBD.svg)](https://github.com/dvillegastech/ReaxBD/stargazers)
+[![GitHub stars](https://img.shields.io/github/stars/dvillegastech/Reax-BD.svg)](https://github.com/dvillegastech/Reax-BD/stargazers)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Open Source Love](https://badges.frapsoft.com/os/v1/open-source.svg?v=103)](https://github.com/ellerbrock/open-source-badges/)
 [![Dart](https://img.shields.io/badge/Dart-%E2%9D%A4-blue)](https://dart.dev)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/dvillegastech/Reax-BD/pulls)
+
+**🌟 100% Open Source | MIT Licensed | Community-Driven**
 
 **The simplest way to store data in Dart & Flutter.** Start with just 3 lines of code, scale to millions of records.
 
 > 🆕 **Version 1.4.0**: Introducing Simple API - Zero configuration, 3 lines to start! [See changelog](CHANGELOG.md)
+
+## 🌟 Open Source Project
+
+ReaxDB is a **free and open source** project licensed under the MIT License. This means you can:
+- ✅ Use it in personal and commercial projects
+- ✅ Modify and distribute the source code
+- ✅ Contribute to make it better for everyone
+- ✅ Fork it and create your own version
+
+We believe in the power of open source to create better software together! [Join us on GitHub →](https://github.com/dvillegastech/Reax-BD)
 
 ```dart
 // That's it! You're ready to go
@@ -204,13 +219,53 @@ items.forEach((_, item) {
 - 💬 [Chat App](examples/chat_app.dart) - Real-time chat with encryption
 - 🎮 [Flutter Demo](example/lib/simple_demo.dart) - Interactive Flutter demo
 
+## Open Source & Contributing
+
+ReaxDB is **100% open source** and we love contributions from the community! Whether you're fixing bugs, adding features, improving documentation, or sharing ideas - all contributions are welcome.
+
+### How to Contribute
+
+1. 🍴 **Fork the repository** - [github.com/dvillegastech/Reax-BD](https://github.com/dvillegastech/Reax-BD)
+2. 🔧 **Create your feature branch** - `git checkout -b feature/amazing-feature`
+3. 💻 **Make your changes** - Write code, tests, and documentation
+4. ✅ **Run tests** - `flutter test`
+5. 📤 **Submit a Pull Request** - We'll review it ASAP!
+
+### Ways to Contribute
+
+- **🐛 Report bugs** - Found an issue? [Let us know!](https://github.com/dvillegastech/Reax-BD/issues)
+- **💡 Suggest features** - Have an idea? [Open a discussion!](https://github.com/dvillegastech/Reax-BD/discussions)
+- **📝 Improve documentation** - Help others understand ReaxDB better
+- **🌍 Translations** - Help make ReaxDB accessible globally
+- **⭐ Star the repo** - Show your support and help others discover ReaxDB
+- **📢 Share** - Blog about your experience, tweet, or tell your friends!
+
+### Community
+
+Join our growing open source community:
+
+- 💬 [GitHub Discussions](https://github.com/dvillegastech/Reax-BD/discussions) - Ask questions, share ideas
+- 🐛 [Issue Tracker](https://github.com/dvillegastech/Reax-BD/issues) - Report bugs, request features
+- 📧 [Email](mailto:contact@dvillegas.tech) - For security issues or private concerns
+
+### Contributors
+
+A huge thank you to all our contributors! 🙏
+
+<!-- ALL-CONTRIBUTORS-LIST:START -->
+<!-- ALL-CONTRIBUTORS-LIST:END -->
+
+Want to see your name here? [Start contributing today!](https://github.com/dvillegastech/Reax-BD/blob/main/CONTRIBUTING.md)
+
 ## Support
 
-- 🐛 [Report Issues](https://github.com/dvillegastech/ReaxBD/issues)
-- ⭐ [Star on GitHub](https://github.com/dvillegastech/ReaxBD)
+- 🐛 [Report Issues](https://github.com/dvillegastech/Reax-BD/issues)
+- ⭐ [Star on GitHub](https://github.com/dvillegastech/Reax-BD)
 - ☕ [Support Development](https://buymeacoffee.com/dvillegas)
 
 ## License
+
+This project is **open source** and available under the **MIT License**.
 
 MIT License - see [LICENSE](LICENSE) file for details.
 

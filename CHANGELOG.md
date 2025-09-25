@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] - 2025-09-25
+
+### Changed
+- Updated GitHub repository URL from `ReaxBD` to `Reax-BD`
+- Enhanced README to emphasize open source nature of the project
+- Added comprehensive contributing guidelines
+- Updated all documentation links to new repository URL
+
+### Added
+- Open source badges (MIT License, PRs Welcome, Open Source Love)
+- Detailed contribution section with guidelines for community participation
+- Contributors section for acknowledging community contributions
+
 ## [1.4.0] - 2025-08-20
 
 ### Added

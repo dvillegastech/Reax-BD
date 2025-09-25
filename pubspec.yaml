@@ -1,9 +1,9 @@
 name: reaxdb_dart
 description: "The fastest NoSQL database for pure Dart. 21,000+ writes/sec, instant cache reads, built-in encryption. Zero native dependencies."
-version: 1.4.0
-homepage: https://github.com/dvillegastech/ReaxBD
-repository: https://github.com/dvillegastech/ReaxBD
-issue_tracker: https://github.com/dvillegastech/ReaxBD/issues
+version: 1.4.1
+homepage: https://github.com/dvillegastech/Reax-BD
+repository: https://github.com/dvillegastech/Reax-BD
+issue_tracker: https://github.com/dvillegastech/Reax-BD/issues
 
 topics:
   - database
