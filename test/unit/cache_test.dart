@@ -1,257 +1,200 @@
-import 'package:test/test.dart';
-import 'package:reaxdb_dart/src/core/cache/multi_level_cache.dart';
 import 'dart:typed_data';
 
+import 'package:reaxdb_dart/src/core/cache/multi_level_cache.dart';
+import 'package:test/test.dart';
+
+Uint8List bytes(String s) => Uint8List.fromList(s.codeUnits);
+
 void main() {
-  group('MultiLevelCache Tests', () {
-    late MultiLevelCache cache;
-
-    setUp(() {
-      cache = MultiLevelCache(
-        l1MaxSize: 100,
-        l1MaxMemory: 1024 * 1024, // 1MB
-        l2MaxSize: 200,
-        l2MaxMemory: 2 * 1024 * 1024, // 2MB
-        l3MaxSize: 300,
-        l3MaxMemory: 3 * 1024 * 1024, // 3MB
-      );
+  group('ReaxCache basics', () {
+    test('stores and retrieves values', () {
+      final ReaxCache cache = ReaxCache();
+      cache.put('a', bytes('one'));
+      expect(cache.get('a'), equals(bytes('one')));
+      expect(cache.get('missing'), isNull);
     });
 
-    test('should store and retrieve data from L1 cache', () {
-      final key = 'test_key';
-      final value = Uint8List.fromList([1, 2, 3, 4, 5]);
-
-      cache.put(key, value, level: CacheLevel.l1);
-      final retrieved = cache.get(key);
-
-      expect(retrieved, equals(value));
+    test('overwriting a key replaces value and memory accounting', () {
+      final ReaxCache cache = ReaxCache();
+      cache.put('a', bytes('short'));
+      final int before = cache.memoryBytes;
+      cache.put('a', bytes('a much longer value than before'));
+      expect(cache.length, equals(1));
+      expect(cache.memoryBytes, greaterThan(before));
+      cache.remove('a');
+      expect(cache.memoryBytes, equals(0));
     });
 
-    test('should promote data from L2 to L1 on access', () {
-      final key = 'test_key_l2';
-      final value = Uint8List.fromList([10, 20, 30]);
-
-      // Put in L2
-      cache.put(key, value, level: CacheLevel.l2);
-
-      // Get should promote to L1
-      final retrieved = cache.get(key);
-
-      expect(retrieved, equals(value));
-
-      // Verify it's now in L1 by checking stats
-      final stats = cache.getStats();
-      expect(stats.l1Hits, greaterThan(0));
-    });
-
-    test('should handle multiple cache levels correctly', () {
-      final keyL1 = 'key_l1';
-      final keyL2 = 'key_l2';
-      final keyL3 = 'key_l3';
-
-      final valueL1 = Uint8List.fromList([1, 1, 1]);
-      final valueL2 = Uint8List.fromList([2, 2, 2]);
-      final valueL3 = Uint8List.fromList([3, 3, 3]);
-
-      cache.put(keyL1, valueL1, level: CacheLevel.l1);
-      cache.put(keyL2, valueL2, level: CacheLevel.l2);
-      cache.put(keyL3, valueL3, level: CacheLevel.l3);
-
-      expect(cache.get(keyL1), equals(valueL1));
-      expect(cache.get(keyL2), equals(valueL2));
-      expect(cache.get(keyL3), equals(valueL3));
-    });
-
-    test('should remove key from all cache levels', () {
-      final key = 'remove_test';
-      final value = Uint8List.fromList([42]);
-
-      cache.put(key, value, level: CacheLevel.l1);
-      cache.put(key, value, level: CacheLevel.l2);
-      cache.put(key, value, level: CacheLevel.l3);
-
-      cache.remove(key);
-
-      expect(cache.get(key), isNull);
-    });
-
-    test('should clear all cache levels', () {
-      // Add multiple entries
-      for (int i = 0; i < 10; i++) {
-        cache.put('key_$i', Uint8List.fromList([i]), level: CacheLevel.l1);
-      }
-
-      expect(cache.getTotalEntryCount(), greaterThan(0));
-
+    test('remove and clear', () {
+      final ReaxCache cache = ReaxCache();
+      cache.put('a', bytes('1'));
+      cache.put('b', bytes('2'));
+      cache.remove('a');
+      expect(cache.get('a'), isNull);
       cache.clear();
-
-      expect(cache.getTotalEntryCount(), equals(0));
+      expect(cache.length, equals(0));
+      expect(cache.memoryBytes, equals(0));
     });
 
-    test('should invalidate entries by pattern', () {
-      // Add entries with pattern
-      cache.put('user:1', Uint8List.fromList([1]), level: CacheLevel.l1);
-      cache.put('user:2', Uint8List.fromList([2]), level: CacheLevel.l1);
-      cache.put('post:1', Uint8List.fromList([3]), level: CacheLevel.l1);
+    test('containsKey does not touch statistics', () {
+      final ReaxCache cache = ReaxCache();
+      cache.put('a', bytes('1'));
+      expect(cache.containsKey('a'), isTrue);
+      expect(cache.containsKey('b'), isFalse);
+      expect(cache.stats.hits, equals(0));
+      expect(cache.stats.misses, equals(0));
+    });
+  });
 
-      cache.invalidatePattern('user:.*');
+  group('eviction', () {
+    test('evicts least recently used first', () {
+      final ReaxCache cache = ReaxCache(maxEntries: 3);
+      cache.put('a', bytes('1'));
+      cache.put('b', bytes('2'));
+      cache.put('c', bytes('3'));
+      cache.get('a'); // refresh 'a'
+      cache.put('d', bytes('4')); // evicts 'b'
 
-      expect(cache.get('user:1'), isNull);
-      expect(cache.get('user:2'), isNull);
-      expect(cache.get('post:1'), isNotNull);
+      expect(cache.get('b'), isNull);
+      expect(cache.get('a'), isNotNull);
+      expect(cache.get('c'), isNotNull);
+      expect(cache.get('d'), isNotNull);
+      expect(cache.stats.evictions, equals(1));
     });
 
-    test('should handle cache overflow correctly', () {
-      // Fill L1 cache beyond capacity
-      for (int i = 0; i < 150; i++) {
-        cache.put('overflow_$i', Uint8List(100), level: CacheLevel.l1);
+    test('respects the memory bound', () {
+      final ReaxCache cache = ReaxCache(maxEntries: 1000, maxMemoryBytes: 400);
+      for (int i = 0; i < 10; i++) {
+        cache.put('key$i', Uint8List(64));
       }
-
-      // Should not exceed max size
-      final stats = cache.getStats();
-      expect(stats.totalEntries, lessThanOrEqualTo(100));
+      expect(cache.memoryBytes, lessThanOrEqualTo(400));
+      expect(cache.length, lessThan(10));
     });
 
-    test('should track cache statistics accurately', () {
+    test('eviction after remove does not crash', () {
+      // The old LFU cache could crash evicting from an empty frequency
+      // group after remove(); the collapsed cache must stay consistent.
+      final ReaxCache cache = ReaxCache(maxEntries: 2);
+      cache.put('a', bytes('1'));
+      cache.put('b', bytes('2'));
+      cache.remove('a');
+      cache.put('c', bytes('3'));
+      cache.put('d', bytes('4')); // forces eviction
+      expect(cache.length, equals(2));
+    });
+  });
+
+  group('statistics', () {
+    test('one logical miss counts exactly once', () {
+      // The old multi-level stats counted one miss as three (L1+L2+L3).
+      final ReaxCache cache = ReaxCache();
+      cache.get('absent');
+      expect(cache.stats.misses, equals(1));
+      expect(cache.stats.hits, equals(0));
+    });
+
+    test('hit ratio reflects logical lookups', () {
+      final ReaxCache cache = ReaxCache();
+      cache.put('a', bytes('1'));
+      cache.get('a'); // hit
+      cache.get('b'); // miss
+      expect(cache.stats.hits, equals(1));
+      expect(cache.stats.misses, equals(1));
+      expect(cache.stats.hitRatio, equals(0.5));
+    });
+  });
+
+  group('TTL', () {
+    test('entries expire after their ttl', () async {
+      final ReaxCache cache = ReaxCache();
+      cache.put('a', bytes('1'), ttl: const Duration(milliseconds: 20));
+      expect(cache.get('a'), isNotNull);
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+      expect(cache.get('a'), isNull);
+      expect(cache.stats.expirations, equals(1));
+      expect(cache.length, equals(0));
+    });
+
+    test('absolute expiresAt is honored', () async {
+      final ReaxCache cache = ReaxCache();
       cache.put(
-        'stat_test',
-        Uint8List.fromList([1, 2, 3]),
-        level: CacheLevel.l1,
+        'a',
+        bytes('1'),
+        expiresAt: DateTime.now().add(const Duration(milliseconds: 20)),
       );
-
-      // First get - cache hit
-      cache.get('stat_test');
-
-      // Non-existent key - cache miss
-      cache.get('non_existent');
-
-      final stats = cache.getStats();
-      expect(stats.l1Hits, equals(1));
-      expect(stats.l1Misses, greaterThanOrEqualTo(1));
-      expect(stats.hitRatio, greaterThan(0));
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+      expect(cache.get('a'), isNull);
     });
 
-    test('should preload data efficiently', () {
-      final preloadData = <String, Uint8List>{
-        'preload_1': Uint8List.fromList([1]),
-        'preload_2': Uint8List.fromList([2]),
-        'preload_3': Uint8List.fromList([3]),
-      };
-
-      cache.preload(preloadData, level: CacheLevel.l2);
-
-      expect(cache.get('preload_1'), equals(preloadData['preload_1']));
-      expect(cache.get('preload_2'), equals(preloadData['preload_2']));
-      expect(cache.get('preload_3'), equals(preloadData['preload_3']));
+    test('default ttl applies when none is given', () async {
+      final ReaxCache cache = ReaxCache(
+        defaultTtl: const Duration(milliseconds: 20),
+      );
+      cache.put('a', bytes('1'));
+      cache.put('b', bytes('2'), ttl: const Duration(minutes: 5));
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+      expect(cache.get('a'), isNull);
+      expect(cache.get('b'), isNotNull);
     });
 
-    test('should return correct memory usage', () {
-      final largeData = Uint8List(1000);
-      cache.put('memory_test', largeData, level: CacheLevel.l1);
-
-      expect(cache.getTotalMemoryUsage(), greaterThan(0));
-      expect(cache.getTotalMemoryUsage(), greaterThanOrEqualTo(1000));
+    test('removeExpired reclaims expired entries eagerly', () async {
+      final ReaxCache cache = ReaxCache();
+      cache.put('a', bytes('1'), ttl: const Duration(milliseconds: 10));
+      cache.put('b', bytes('2'));
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+      expect(cache.removeExpired(), equals(1));
+      expect(cache.length, equals(1));
+      expect(cache.stats.expirations, equals(1));
     });
   });
 
-  group('LRUCache Tests', () {
-    late LRUCache lruCache;
+  group('invalidation', () {
+    test('removePrefix removes only matching keys', () {
+      final ReaxCache cache = ReaxCache();
+      cache.put('users:1', bytes('a'));
+      cache.put('users:2', bytes('b'));
+      cache.put('orders:1', bytes('c'));
 
-    setUp(() {
-      lruCache = LRUCache(maxSize: 3, maxMemory: 1024);
+      cache.removePrefix('users:');
+      expect(cache.get('users:1'), isNull);
+      expect(cache.get('users:2'), isNull);
+      expect(cache.get('orders:1'), isNotNull);
     });
 
-    test('should evict least recently used item when full', () {
-      lruCache.put('a', Uint8List.fromList([1]));
-      lruCache.put('b', Uint8List.fromList([2]));
-      lruCache.put('c', Uint8List.fromList([3]));
+    test('invalidatePattern supports star, prefix-star and exact keys', () {
+      final ReaxCache cache = ReaxCache();
+      cache.put('users:1', bytes('a'));
+      cache.put('orders:1', bytes('b'));
 
-      // Access 'a' to make it more recent
-      lruCache.get('a');
+      cache.invalidatePattern('users:*');
+      expect(cache.containsKey('users:1'), isFalse);
+      expect(cache.containsKey('orders:1'), isTrue);
 
-      // Add new item, should evict 'b'
-      lruCache.put('d', Uint8List.fromList([4]));
+      cache.invalidatePattern('orders:1');
+      expect(cache.containsKey('orders:1'), isFalse);
 
-      expect(lruCache.get('a'), isNotNull);
-      expect(lruCache.get('b'), isNull); // Evicted
-      expect(lruCache.get('c'), isNotNull);
-      expect(lruCache.get('d'), isNotNull);
+      cache.put('x', bytes('1'));
+      cache.invalidatePattern('*');
+      expect(cache.length, equals(0));
     });
 
-    test('should update access count on get', () {
-      lruCache.put('key', Uint8List.fromList([1]));
+    test('regex patterns still work as a fallback', () {
+      final ReaxCache cache = ReaxCache();
+      cache.put('users:1', bytes('a'));
+      cache.put('users:22', bytes('b'));
+      cache.put('other', bytes('c'));
 
-      final initialHits = lruCache.hits;
-      lruCache.get('key');
-
-      expect(lruCache.hits, equals(initialHits + 1));
-    });
-
-    test('should track misses correctly', () {
-      final initialMisses = lruCache.misses;
-      lruCache.get('non_existent');
-
-      expect(lruCache.misses, equals(initialMisses + 1));
+      cache.invalidatePattern(r'users:\d$');
+      expect(cache.containsKey('users:1'), isFalse);
+      expect(cache.containsKey('users:22'), isTrue);
+      expect(cache.containsKey('other'), isTrue);
     });
   });
 
-  group('LFUCache Tests', () {
-    late LFUCache lfuCache;
-
-    setUp(() {
-      lfuCache = LFUCache(maxSize: 3, maxMemory: 1024);
-    });
-
-    test('should evict least frequently used item when full', () {
-      lfuCache.put('a', Uint8List.fromList([1]));
-      lfuCache.put('b', Uint8List.fromList([2]));
-      lfuCache.put('c', Uint8List.fromList([3]));
-
-      // Access 'a' and 'b' multiple times
-      lfuCache.get('a');
-      lfuCache.get('a');
-      lfuCache.get('b');
-
-      // Add new item, should evict 'c' (least frequent)
-      lfuCache.put('d', Uint8List.fromList([4]));
-
-      expect(lfuCache.get('a'), isNotNull);
-      expect(lfuCache.get('b'), isNotNull);
-      expect(lfuCache.get('c'), isNull); // Evicted
-      expect(lfuCache.get('d'), isNotNull);
-    });
-
-    test('should update frequency on access', () {
-      lfuCache.put('freq_test', Uint8List.fromList([1]));
-
-      // Access multiple times
-      for (int i = 0; i < 5; i++) {
-        lfuCache.get('freq_test');
-      }
-
-      // Fill cache
-      lfuCache.put('other1', Uint8List.fromList([2]));
-      lfuCache.put('other2', Uint8List.fromList([3]));
-
-      // Add one more - freq_test should not be evicted due to high frequency
-      lfuCache.put('other3', Uint8List.fromList([4]));
-
-      expect(lfuCache.get('freq_test'), isNotNull);
-    });
-
-    test('should handle same frequency items correctly', () {
-      // Add items with same frequency
-      lfuCache.put('a', Uint8List.fromList([1]));
-      lfuCache.put('b', Uint8List.fromList([2]));
-      lfuCache.put('c', Uint8List.fromList([3]));
-
-      // All have frequency 1, oldest should be evicted
-      lfuCache.put('d', Uint8List.fromList([4]));
-
-      expect(
-        lfuCache.get('a'),
-        isNull,
-      ); // First in, first out for same frequency
+  group('construction', () {
+    test('rejects non-positive bounds', () {
+      expect(() => ReaxCache(maxEntries: 0), throwsArgumentError);
+      expect(() => ReaxCache(maxMemoryBytes: 0), throwsArgumentError);
     });
   });
 }

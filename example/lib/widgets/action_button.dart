@@ -1,34 +1,46 @@
 import 'package:flutter/material.dart';
 
+/// A labelled button used by the demo screens.
+///
+/// Passing a null [onPressed] disables the button, which the demos use while
+/// an operation is running.
 class ActionButton extends StatelessWidget {
-  final String text;
-  final VoidCallback onPressed;
-  final Color color;
-  final IconData icon;
-  final bool isActive;
-
+  /// Creates an action button.
   const ActionButton({
     super.key,
-    required this.text,
-    required this.onPressed,
-    required this.color,
+    required this.label,
     required this.icon,
-    this.isActive = false,
+    required this.onPressed,
+    this.tonal = false,
   });
+
+  /// Text shown on the button.
+  final String label;
+
+  /// Leading icon.
+  final IconData icon;
+
+  /// Called when the button is tapped, or null to disable it.
+  final VoidCallback? onPressed;
+
+  /// Whether to render the lower-emphasis tonal style.
+  final bool tonal;
 
   @override
   Widget build(BuildContext context) {
-    return ElevatedButton.icon(
+    final Widget iconWidget = Icon(icon, size: 18);
+    final Widget labelWidget = Text(label);
+    if (tonal) {
+      return FilledButton.tonalIcon(
+        onPressed: onPressed,
+        icon: iconWidget,
+        label: labelWidget,
+      );
+    }
+    return FilledButton.icon(
       onPressed: onPressed,
-      icon: Icon(icon, size: 18),
-      label: Text(text, style: TextStyle(fontWeight: FontWeight.w600)),
-      style: ElevatedButton.styleFrom(
-        backgroundColor: isActive ? color.withValues(alpha: 0.8) : color,
-        foregroundColor: Colors.white,
-        padding: EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-        elevation: isActive ? 6 : 3,
-      ),
+      icon: iconWidget,
+      label: labelWidget,
     );
   }
 }

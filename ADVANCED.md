@@ -1,370 +1,326 @@
-# ReaxDB Advanced Documentation
+# ReaxDB — advanced guide
 
-This document contains advanced features and detailed configuration options for ReaxDB.
+Everything here describes behaviour that exists in the code. Where a guarantee
+has limits, the limits are stated.
 
-## Table of Contents
-- [Configuration Options](#configuration-options)
-- [Secondary Indexes](#secondary-indexes)
-- [Transactions](#transactions)
-- [Performance Tuning](#performance-tuning)
+## Contents
+
+- [Opening a database](#opening-a-database)
+- [Isolation levels](#isolation-levels)
+- [The write pipeline](#the-write-pipeline)
+- [Key space and the reserved 0x00 prefix](#key-space-and-the-reserved-0x00-prefix)
+- [Storage engine](#storage-engine)
+- [Cache](#cache)
+- [Queries, indexes and the total order](#queries-indexes-and-the-total-order)
 - [Encryption](#encryption)
-- [Streaming and Real-time](#streaming-and-real-time)
-- [Aggregations](#aggregations)
-- [Architecture](#architecture)
+- [Logging and redaction](#logging-and-redaction)
+- [Concurrency model](#concurrency-model)
+- [Operational notes](#operational-notes)
 
-## Configuration Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `memtableSizeMB` | 4 | Memory table size in megabytes |
-| `pageSize` | 4096 | Storage page size in bytes |
-| `l1CacheSize` | 1000 | Level 1 cache maximum entries |
-| `l2CacheSize` | 5000 | Level 2 cache maximum entries |
-| `l3CacheSize` | 10000 | Level 3 cache maximum entries |
-| `compressionEnabled` | true | Enable data compression |
-| `syncWrites` | true | Synchronous write operations |
-| `maxImmutableMemtables` | 4 | Maximum immutable memtables |
-
-## Secondary Indexes
-
-Create indexes for fast queries on any field:
+## Opening a database
 
 ```dart
-// Create indexes
-await db.createIndex('users', 'email');
-await db.createIndex('users', 'age');
+final db = await ReaxDB.open(
+  path: 'data/app',
 
-// Query by indexed field
-final user = await db.collection('users')
-    .whereEquals('email', 'john@example.com')
-    .findOne();
+  // Durability.
+  syncMode: SyncMode.full,
 
-// Range queries
-final youngUsers = await db.collection('users')
-    .whereBetween('age', 18, 30)
-    .orderBy('age')
-    .find();
+  // Encryption.
+  encryption: EncryptionConfig.aes256(key: keyBytes32),
 
-// Complex queries
-final results = await db.collection('users')
-    .whereEquals('city', 'New York')
-    .whereGreaterThan('age', 21)
-    .limit(10)
-    .find();
-```
+  // Storage tuning.
+  memtableSizeBytes: 4 * 1024 * 1024,
 
-## Transactions
+  // Cache tuning.
+  cacheMaxEntries: 10000,
+  cacheMaxMemoryBytes: 64 * 1024 * 1024,
+  cacheDefaultTtl: null,
 
-### Basic Transactions
+  // Logging.
+  logLevel: LogLevel.warning,
+  logOutputs: [ConsoleLogOutput()],
+  loggerName: 'app',
 
-```dart
-await db.transaction((txn) async {
-  await txn.put('account:1', {'balance': 1000});
-  await txn.put('account:2', {'balance': 500});
-  
-  // Transfer money
-  final account1 = await txn.get('account:1');
-  final account2 = await txn.get('account:2');
-  
-  await txn.put('account:1', {'balance': account1['balance'] - 100});
-  await txn.put('account:2', {'balance': account2['balance'] + 100});
-});
-```
+  // Transactions.
+  defaultIsolationLevel: IsolationLevel.readCommitted,
+  lockTimeout: const Duration(seconds: 10),
 
-### Advanced Transactions
-
-```dart
-// With retry logic
-await db.withTransaction(
-  (txn) async {
-    await txn.put('key', 'value', (k, v) async {});
-  },
-  maxRetries: 3,
-  retryDelay: Duration(milliseconds: 100),
-  isolationLevel: IsolationLevel.serializable,
-);
-
-// Read-only transactions
-final txn = await db.beginReadOnlyTransaction();
-final value = await txn.get('key', (k) async => await db.get(k));
-await txn.rollback();
-
-// Transactions with savepoints
-final txn = await db.beginEnhancedTransaction();
-await txn.put('key1', 'value1', (k, v) async {});
-await txn.savepoint('sp1');
-await txn.put('key2', 'value2', (k, v) async {});
-await txn.rollbackToSavepoint('sp1');
-await txn.commit((changes) async {});
-```
-
-## Performance Tuning
-
-### Write Performance Optimization
-
-```dart
-// Batch operations for better performance
-await db.putBatch({
-  'user:1': {'name': 'Alice', 'age': 25},
-  'user:2': {'name': 'Bob', 'age': 30},
-  'user:3': {'name': 'Charlie', 'age': 35},
-});
-
-// Async writes for better throughput
-final config = DatabaseConfig(
-  syncWrites: false,  // Async writes
-  memtableSizeMB: 8,  // Larger memtable
+  // Schema.
+  schemaVersion: 1,
+  onUpgrade: null,
 );
 ```
 
-### Cache Configuration
+`close()` drains work already accepted, then closes the transaction manager,
+the index manager, the storage engine (which flushes the memtable and closes
+the WAL), the cache, the change-stream hub and the logger, releases the
+on-disk lock and unregisters the instance. It is idempotent.
 
-```dart
-final config = DatabaseConfig(
-  l1CacheSize: 2000,   // Hot data cache
-  l2CacheSize: 10000,  // Warm data cache
-  l3CacheSize: 50000,  // Cold data cache
-);
+`ReaxDB.closeAll()` closes every instance open in the current isolate. It
+exists for tests and for shutdown hooks.
+
+## Isolation levels
+
+Four levels are implemented. Do not assume more than is listed.
+
+### `IsolationLevel.readCommitted` (default)
+
+Reads take no locks and always observe the latest committed value. Writes take
+exclusive key locks held until commit or abort. Dirty reads are impossible
+because uncommitted writes never reach storage. Non-repeatable reads are
+possible.
+
+### `IsolationLevel.repeatableRead`
+
+Reads take shared key locks held until commit or abort and are served from the
+transaction's read set on repeat, so a value read twice never changes. Reading
+an absent key also locks that key, which blocks a concurrent insert of that
+exact key.
+
+### `IsolationLevel.serializable`
+
+`repeatableRead` plus commit-time revalidation of the whole read set, including
+keys read as absent. "Read a missing key, someone else inserts it, commit" is
+rejected with `TransactionConflictException`.
+
+**Limit:** point reads and writes are serializable. Range and predicate
+phantoms are out of scope, because the transaction API has no range read — a
+query executed outside the transaction is not part of its read set.
+
+### `IsolationLevel.optimistic`
+
+No locks. Reads record the committed version of each key; commit revalidates
+the version of every key read or written and fails with
+`TransactionConflictException` if any changed. First committer wins.
+
+### Retries
+
+`db.transaction(..., maxAttempts: 3)` retries only on
+`TransactionConflictException` and `DeadlockException`, with exponential
+backoff (`5ms * 2^(attempt-1)`, no jitter). Any other exception aborts and
+propagates immediately.
+
+Deadlocks are detected by cycle detection in the lock manager and reported as
+`DeadlockException`. `lockTimeout` is a backstop for waits that are not part of
+a detected cycle; exceeding it raises `TransactionTimeoutException`.
+
+## The write pipeline
+
+One private method, `ReaxDB._applyMutations`, is the only code path that
+mutates storage on behalf of a user write. It runs, in order:
+
+1. **Build the batch.** For each mutation, if the key parses as
+   `collection:id` and that collection has indexes, the old document is loaded
+   and `IndexManager.buildIndexOps` produces the posting deletes and inserts.
+   The value operation is appended to the same list.
+2. **`StorageEngine.writeBatch(ops)` — the durability point.** The WAL append
+   inside it returns only when the batch is durable per the sync mode. The
+   batch is atomic: after a crash either all of it or none of it is visible,
+   so a document is never visible without its index postings.
+3. **Optional escalation.** A `sync:` override stronger than the database
+   default pushes the WAL to the OS or fsyncs it here.
+4. **Cache.** Only now. The cache stores the plaintext record envelope — never
+   ciphertext, and never before durability, so a failed write cannot leave a
+   phantom entry.
+5. **Events.** `ChangeStreamHub.publish` for every mutation.
+
+### Transactions and index maintenance
+
+The transaction manager owns the atomic batch for a transaction's values.
+After `commit` returns a `CommitResult`, the database walks its
+`AppliedOperation` list and performs index maintenance, cache invalidation and
+event publication.
+
+**Limit:** index postings for transactional writes are written in a second
+batch that follows the commit. If the process dies between the two, the
+documents are durable but their index postings for that transaction are not.
+Rebuild with `dropIndex` + `createIndex` if you need to recover from that. For
+writes where index durability must be atomic with the document, use `put` /
+`putBatch`, which put both in one batch.
+
+## Key space and the reserved 0x00 prefix
+
+| Prefix | Contents |
+| --- | --- |
+| `0x00 'i' 'd' 'x' 0x00 ...` | secondary index postings |
+| `0x00 'i' 'd' 'x' 'm' 0x00 ...` | index metadata |
+| anything else | user keys |
+
+`ReaxDB.encodeKey` rejects an empty key and any key whose first UTF-8 byte is
+`0x00` with `InvalidKeyException`. All iteration APIs start at byte `0x01`, so
+internal keys are structurally invisible to `scan`, `scanPrefix`, `keys`,
+`range`, `exportTo` and `info().entryCount`.
+
+Index postings are keyed by `(index, encoded field values, document id)` with
+an empty value, so inserting or removing one posting is a single key write —
+never a read-modify-write of a posting list blob.
+
+## Storage engine
+
+- Leveled LSM tree. Writes go to the WAL and then an in-memory memtable; a
+  full memtable is flushed inline to an L0 SSTable and the WAL is checkpointed.
+- Each SSTable carries a bloom filter and min/max key fences, so a point read
+  skips files that cannot contain the key.
+- `scan` merges the memtable snapshot with every SSTable level, honouring
+  tombstones with newest-wins. It is the single source of truth for iteration.
+- `StorageStats.immutableMemtableCount` is always 0: flushes are inline, so
+  there is never a sealed-but-unflushed memtable.
+- `flush()` persists the memtable and checkpoints the WAL. `compact()` flushes
+  and then compacts every level until size targets are met.
+
+Both `flush()` and `compact()` are serialized against the export snapshot and
+the write pipeline, so a snapshot scan can never race a compaction that
+deletes the files it is reading.
+
+## Cache
+
+One LRU cache with per-entry TTL, bounded by entry count and by memory.
+
+- It stores exactly one representation: the **plaintext record envelope**,
+  after decryption and before deserialization. This makes the 1.x
+  double-decrypt bug (put cached ciphertext, get cached plaintext)
+  structurally impossible.
+- A `get` that finds an expired entry removes it and counts one miss and one
+  expiration. One logical lookup is one hit or one miss, never three.
+- Prefix invalidation is `O(log n + k)` through a key-sorted view.
+
+`db.cacheStats` reports hits, misses, evictions, expirations, entry count,
+memory and hit ratio.
+
+## Queries, indexes and the total order
+
+All value comparisons — conditions, `orderBy`, aggregation, `distinct`,
+joins — use one total order:
+
+```text
+null < false < true < numbers < strings < lists < maps < other
 ```
+
+`int` and `double` share one numeric space, so `whereEquals('n', 5)` matches
+`5.0`. Strings order by UTF-8 bytes, lists compare element-wise, maps compare
+by sorted key/value pairs, and anything else compares by `toString()`. The
+comparator is defined as `memcmp` of the index encodings, so the indexed path
+and the scan path cannot disagree.
+
+**Limit:** integers with magnitude above 2^53 lose precision inside the
+unified numeric space. Because query results are always re-filtered against
+the loaded documents, this can only widen an index range scan, never produce a
+wrong result.
+
+`IndexManager.candidateIds` returns `null` when no index can serve any
+condition (the caller scans) and an empty set when an index was consulted and
+nothing matched. Those two cases are never conflated.
+
+Compound indexes are used for an equality prefix plus one trailing range or
+`whereIn` component, in field order.
 
 ## Encryption
 
-ReaxDB provides multiple encryption options:
+See the envelope layout in the README. Additional details:
 
-### Encryption Types
+- The GCM authentication tag is 128 bits and the IV is a fresh 96-bit value
+  from `Random.secure()` per value.
+- Decryption validates the envelope version and that the stored algorithm id
+  matches the configured algorithm before attempting anything.
+- Authentication failure (tampering or a wrong key) throws
+  `EncryptionException`. There is no path that returns partially decrypted
+  bytes.
+- `KeyDerivation.defaultIterations` is 210,000 (the 2023+ OWASP figure for
+  PBKDF2-HMAC-SHA256) and `minIterations` is 1,000. Lower values are rejected.
+  Tests may pass a low count explicitly; production code should not.
+- The salt is per database, generated with `Random.secure()` on first open and
+  stored in `reaxdb.meta` together with the iteration count.
+- Only values are encrypted. Keys, index postings and the header are
+  plaintext.
 
-- **`EncryptionType.none`**: No encryption (fastest)
-- **`EncryptionType.xor`**: XOR encryption (fast, moderate security)
-- **`EncryptionType.aes256`**: AES-256-GCM encryption (secure, slower)
+`db.encryptionInfo` reports the **effective** algorithm, never a requested one.
 
-### Configuration
+## Logging and redaction
+
+Loggers are per instance:
 
 ```dart
-// AES-256 encryption (most secure)
 final db = await ReaxDB.open(
-  'secure_database',
-  config: DatabaseConfig.withAes256Encryption(),
-  encryptionKey: 'your-256-bit-encryption-key',
+  path: 'data/app',
+  logLevel: LogLevel.debug,
+  logOutputs: [ConsoleLogOutput(), MemoryLogOutput()],
 );
+```
 
-// XOR encryption (faster)
+`ReaxLogger.root` (also exported as the top-level `logger`) remains available
+for code not tied to a database. `db.close()` closes the database's logger and
+the outputs it owns.
+
+File logging lives behind a separate entry point so the main barrel stays free
+of it:
+
+```dart
+import 'package:reaxdb_dart/reaxdb_dart_io.dart';
+
 final db = await ReaxDB.open(
-  'fast_secure_database',
-  config: DatabaseConfig.withXorEncryption(),
-  encryptionKey: 'your-encryption-key',
+  path: 'data/app',
+  logOutputs: [FileLogOutput('logs/reaxdb.log')],
 );
 ```
 
-### WASM Compatibility
+### No-PII policy
 
-ReaxDB automatically detects WASM runtime and provides appropriate fallbacks:
-
-```dart
-// For WASM environments
-final db = await ReaxDB.open(
-  'wasm_database',
-  encryptionType: EncryptionType.xor,  // Better WASM performance
-  encryptionKey: 'your-encryption-key',
-);
-```
-
-## Streaming and Real-time
-
-### Basic Streams
+ReaxDB never logs key contents, value contents, encryption keys, passphrases
+or derived key material, at any level including debug. When a message must
+reference a key or value, use the redaction helpers:
 
 ```dart
-// Listen to all changes
-final subscription = db.changeStream.listen((event) {
-  print('${event.type}: ${event.key} = ${event.value}');
-});
-
-// Listen to specific patterns
-final userStream = db.stream('user:*').listen((event) {
-  print('User updated: ${event.key}');
-});
+Redaction.key('user:ada@example.com');  // key#3f2a9c1d(len=21)
+Redaction.value({'a': 1});              // <redacted Map, 1 entries>
 ```
 
-### Reactive Streams with Operators
+`ReaxEntry.toString()` and `DatabaseChangeEvent.toString()` are redacted the
+same way, because those objects routinely end up in log lines and exception
+messages.
 
-```dart
-// Debounce high-frequency updates
-db.watch()
-  .where((event) => event.key.startsWith('user:'))
-  .debounce(Duration(milliseconds: 500))
-  .map((event) => event.value)
-  .listen((userData) {
-    print('User data changed: $userData');
-  });
+## Concurrency model
 
-// Throttle updates
-db.watchKey('counter')
-  .throttle(Duration(seconds: 1))
-  .listen((event) {
-    print('Counter updated (max once per second): ${event.value}');
-  });
+ReaxDB is single-isolate. Within an isolate:
 
-// Buffer events
-db.watchCollection('logs')
-  .buffer(10)  // Collect 10 events before emitting
-  .listen((events) {
-    print('Got ${events.length} log entries');
-  });
-```
+- The storage engine serializes every mutation, flush, compaction and close.
+- The transaction manager serializes commits behind one mutex.
+- The lock manager provides shared/exclusive key locks with upgrade support
+  and cycle-based deadlock detection.
+- The database facade serializes pipeline writes against export, flush,
+  compaction and close.
 
-## Aggregations
+Concurrent `await`ed calls from the same isolate are safe. Two isolates or two
+processes must not open the same directory; the advisory lock enforces that.
 
-### Basic Aggregations
+## Operational notes
 
-```dart
-final stats = await db.collection('users')
-    .aggregate((agg) => agg
-        .count()
-        .avg('age')
-        .min('age')
-        .max('age')
-        .sum('purchases')
-        .distinct('city'))
-    .executeAggregation();
+### Choosing a sync mode
 
-print('Total users: ${stats['count'].value}');
-print('Average age: ${stats['avg_age'].value}');
-print('Unique cities: ${stats['distinct_city'].value}');
-```
+- `SyncMode.full` — financial records, anything where losing the last
+  acknowledged write is unacceptable. Default.
+- `SyncMode.os` — caches and derived data that must survive a crash of your
+  process but can be rebuilt after a power cut.
+- `SyncMode.none` — throwaway data and benchmarks only.
 
-### Group By Operations
+Prefer batching over lowering the sync mode: `putBatch` costs one durability
+barrier for the whole batch.
 
-```dart
-final salesByRegion = await db.collection('sales')
-    .aggregate((agg) => agg
-        .groupBy('region')
-        .sum('amount')
-        .count()
-        .avg('amount'))
-    .executeAggregation();
+### Reclaiming space
 
-for (final group in salesByRegion) {
-  print('Region: ${group.groupKey}');
-  print('Total sales: ${group.aggregations['sum_amount'].value}');
-  print('Number of sales: ${group.aggregations['count'].value}');
-}
-```
+Deleted and expired entries occupy space until compaction rewrites the level
+that holds them. Call `db.compact()` during idle time after a large deletion,
+and `db.purgeExpired()` if you rely heavily on TTL.
 
-### Text Search
+### Sizing the memtable
 
-```dart
-final searchResults = await db.collection('articles')
-    .search('flutter dart', field: 'content')
-    .limit(10)
-    .find();
-```
+A larger `memtableSizeBytes` means fewer flushes and fewer L0 tables, at the
+cost of a longer WAL replay on open and more resident memory. The 4 MB default
+is a reasonable starting point for mobile.
 
-### Batch Updates and Deletes
+### Backups
 
-```dart
-// Batch updates
-final updateCount = await db.collection('products')
-    .whereEquals('category', 'electronics')
-    .update({'onSale': true, 'discount': 0.2});
-
-print('Updated $updateCount products');
-
-// Batch deletes
-final deleteCount = await db.collection('logs')
-    .whereLessThan('timestamp', DateTime.now().subtract(Duration(days: 30)))
-    .delete();
-
-print('Deleted $deleteCount old logs');
-```
-
-## Architecture
-
-ReaxDB uses a hybrid storage architecture combining:
-
-- **LSM Tree**: Optimized for write-heavy workloads
-- **B+ Tree**: Fast range queries and ordered access
-- **Multi-level Cache**: L1 (object), L2 (page), L3 (query) caching
-- **Write-Ahead Log**: Durability and crash recovery
-- **Connection Pooling**: Concurrent operation management
-
-### Storage Engine
-
-The hybrid storage engine automatically selects the optimal storage strategy based on your workload:
-
-- Small, frequently accessed data → In-memory cache
-- Write-heavy operations → LSM Tree
-- Range queries → B+ Tree
-- Large datasets → Automatic compaction and compression
-
-### Performance Characteristics
-
-- **Read Performance**: 333,333 operations/second (~0.003ms latency)
-- **Write Performance**: 21,276 operations/second (~0.047ms latency)
-- **Batch Operations**: 3,676 operations/second
-- **Cache Hits**: 555,555 operations/second (~0.002ms latency)
-- **Large Files**: 4.8 GB/s write, 1.9 GB/s read
-- **Concurrent Operations**: Up to 10 simultaneous operations
-
-## Logging
-
-Configure logging for debugging and monitoring:
-
-```dart
-import 'package:reaxdb_dart/reaxdb_dart.dart';
-
-// Configure logging
-ReaxLogger.instance.configure(
-  level: LogLevel.debug,
-  outputs: [
-    ConsoleLogOutput(),
-    FileLogOutput('/path/to/logs/app.log'),
-    MemoryLogOutput(maxLines: 1000),
-  ],
-);
-
-// Use the logger
-final logger = ReaxLogger.instance;
-logger.info('Database opened successfully');
-logger.debug('Query executed', metadata: {'query': 'SELECT * FROM users'});
-logger.warning('Cache miss for key: user:123');
-logger.error('Transaction failed', error: exception);
-
-// Disable logging for production
-ReaxLogger.instance.configure(level: LogLevel.none);
-```
-
-## Performance Monitoring
-
-```dart
-// Get performance statistics
-final stats = db.getPerformanceStats();
-print('Cache hit ratio: ${stats['cache']['total_hit_ratio']}');
-
-// Get database info
-final dbInfo = await db.getDatabaseInfo();
-print('Database name: ${dbInfo.name}');
-print('Database size: ${dbInfo.sizeBytes} bytes');
-print('Total entries: ${dbInfo.entryCount}');
-print('Is encrypted: ${dbInfo.isEncrypted}');
-```
-
-## Error Handling
-
-```dart
-try {
-  final value = await db.get('nonexistent-key');
-} on DatabaseException catch (e) {
-  print('Database error: ${e.message}');
-} catch (e) {
-  print('Unexpected error: $e');
-}
-```
-
-## Best Practices
-
-1. **Use batch operations** for multiple writes to improve performance
-2. **Enable compression** for storage efficiency with large datasets  
-3. **Configure cache sizes** based on your application's memory constraints
-4. **Use transactions** for operations that must be atomic
-5. **Close databases** properly to ensure data persistence
-6. **Monitor performance** using built-in statistics methods
-7. **Use the Simple API** for basic operations, advanced API only when needed
+`exportTo` blocks writes for the duration of the scan. On a large database
+schedule it when the application is idle. The archive is a single file with a
+verified SHA-256 digest; keep the digest failure path in mind when restoring
+from cold storage.

@@ -1,222 +1,208 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:reaxdb_dart/reaxdb_dart.dart';
-import 'package:path_provider/path_provider.dart';
 
-class TodoDemoScreen extends StatefulWidget {
+import '../services/database_service.dart';
+import '../widgets/demo_scaffold.dart';
+
+/// A small application built on prefix scans and change streams.
+class TodoDemoScreen extends StatelessWidget {
+  /// Creates the todo demo.
   const TodoDemoScreen({super.key});
 
+  static const String _snippet = '''
+await db.put('todo:\$id', {'title': title, 'completed': false});
+
+// Newest first: keys are time-ordered, so reverse iteration is the sort.
+final todos = await db
+    .scanPrefix<Map<String, dynamic>>('todo:', reverse: true)
+    .toList();
+
+// Every write publishes an event after its durability point.
+_subscription = db.watchPrefix('todo:').listen((_) => reload());
+''';
+
   @override
-  State<TodoDemoScreen> createState() => _TodoDemoScreenState();
+  Widget build(BuildContext context) {
+    return DatabaseDemoScaffold(
+      title: 'Todo list',
+      description:
+          'Todos are stored under the "todo:" prefix with a time-ordered key, '
+          'so listing them newest-first is a reverse prefix scan. The list '
+          'never reloads itself: it reloads when the database says something '
+          'changed.',
+      snippet: _snippet,
+      scrollable: false,
+      open: () => DatabaseService.open('todo'),
+      builder: (BuildContext context, ReaxDB db) => _TodoBody(db: db),
+    );
+  }
 }
 
-class _TodoDemoScreenState extends State<TodoDemoScreen> {
-  SimpleReaxDB? db;
-  List<Map<String, dynamic>> todos = [];
-  final TextEditingController todoController = TextEditingController();
-  bool isLoading = true;
-  
+class _TodoBody extends StatefulWidget {
+  const _TodoBody({required this.db});
+
+  final ReaxDB db;
+
+  @override
+  State<_TodoBody> createState() => _TodoBodyState();
+}
+
+class _TodoBodyState extends State<_TodoBody> {
+  final TextEditingController _controller = TextEditingController();
+  StreamSubscription<DatabaseChangeEvent>? _subscription;
+  List<ReaxEntry<Map<String, dynamic>>> _todos =
+      <ReaxEntry<Map<String, dynamic>>>[];
+
   @override
   void initState() {
     super.initState();
-    initDatabase();
+    _subscription = widget.db
+        .watchPrefix('todo:')
+        .listen((DatabaseChangeEvent _) => _reload());
+    _reload();
   }
-  
-  Future<void> initDatabase() async {
-    final dir = await getApplicationDocumentsDirectory();
-    db = await ReaxDB.simple('todo_demo', path: '${dir.path}/reaxdb_todo');
-    
-    db!.watch('todo:*').listen((event) {
-      loadTodos();
-    });
-    
-    await loadTodos();
-    setState(() {
-      isLoading = false;
-    });
-  }
-  
-  Future<void> loadTodos() async {
-    if (db == null) return;
-    
-    final allTodos = await db!.getAll('todo:*');
-    setState(() {
-      todos = allTodos.values
-          .map((e) => e as Map<String, dynamic>)
-          .toList()
-        ..sort((a, b) => (b['createdAt'] ?? '').compareTo(a['createdAt'] ?? ''));
-    });
-  }
-  
-  Future<void> addTodo(String title) async {
-    if (title.isEmpty) return;
-    
-    final id = DateTime.now().millisecondsSinceEpoch.toString();
-    await db!.put('todo:$id', {
-      'id': id,
-      'title': title,
-      'completed': false,
-      'createdAt': DateTime.now().toIso8601String(),
-    });
-    
-    todoController.clear();
-  }
-  
-  Future<void> toggleTodo(String id, bool currentStatus) async {
-    final todo = await db!.get('todo:$id');
-    if (todo != null) {
-      todo['completed'] = !currentStatus;
-      todo['completedAt'] = !currentStatus ? DateTime.now().toIso8601String() : null;
-      await db!.put('todo:$id', todo);
-    }
-  }
-  
-  Future<void> deleteTodo(String id) async {
-    await db!.delete('todo:$id');
-  }
-  
+
   @override
   void dispose() {
-    todoController.dispose();
-    db?.close();
+    _controller.dispose();
+    _subscription?.cancel();
     super.dispose();
   }
-  
+
+  Future<void> _reload() async {
+    if (widget.db.isClosed) return;
+    final List<ReaxEntry<Map<String, dynamic>>> todos =
+        await widget.db
+            .scanPrefix<Map<String, dynamic>>('todo:', reverse: true)
+            .toList();
+    if (!mounted) return;
+    setState(() => _todos = todos);
+  }
+
+  Future<void> _add(String title) async {
+    final String trimmed = title.trim();
+    if (trimmed.isEmpty) return;
+    _controller.clear();
+    await widget.db
+        .put('todo:${DateTime.now().microsecondsSinceEpoch}', <String, dynamic>{
+          'title': trimmed,
+          'completed': false,
+          'createdAt': DateTime.now().toIso8601String(),
+        });
+  }
+
+  Future<void> _toggle(ReaxEntry<Map<String, dynamic>> todo) =>
+      widget.db.put(todo.key, <String, dynamic>{
+        ...todo.value,
+        'completed': !(todo.value['completed'] as bool? ?? false),
+      });
+
   @override
   Widget build(BuildContext context) {
-    final incompleteTodos = todos.where((t) => !(t['completed'] ?? false)).length;
-    final completedTodos = todos.where((t) => t['completed'] ?? false).length;
-    
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Todo App Demo'),
-        actions: [
-          Center(
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: Text(
-                '$incompleteTodos pending | $completedTodos done',
-                style: const TextStyle(fontSize: 14),
+    final int pending =
+        _todos
+            .where(
+              (ReaxEntry<Map<String, dynamic>> t) =>
+                  !(t.value['completed'] as bool? ?? false),
+            )
+            .length;
+
+    return Column(
+      children: <Widget>[
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+          child: Row(
+            children: <Widget>[
+              Expanded(
+                child: TextField(
+                  controller: _controller,
+                  decoration: const InputDecoration(
+                    labelText: 'What needs to be done?',
+                    border: OutlineInputBorder(),
+                  ),
+                  onSubmitted: _add,
+                ),
               ),
-            ),
+              const SizedBox(width: 8),
+              FilledButton.icon(
+                onPressed: () => _add(_controller.text),
+                icon: const Icon(Icons.add),
+                label: const Text('Add'),
+              ),
+            ],
           ),
-        ],
-      ),
-      body: isLoading
-          ? const Center(child: CircularProgressIndicator())
-          : Column(
-              children: [
-                // Add Todo
-                Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Card(
-                    child: Padding(
-                      padding: const EdgeInsets.all(16),
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: TextField(
-                              controller: todoController,
-                              decoration: const InputDecoration(
-                                labelText: 'What needs to be done?',
-                                border: OutlineInputBorder(),
-                              ),
-                              onSubmitted: addTodo,
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: Row(
+            children: <Widget>[
+              Expanded(
+                child: Text(
+                  '$pending pending, ${_todos.length - pending} done',
+                  style: Theme.of(context).textTheme.bodySmall,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              TextButton.icon(
+                onPressed:
+                    _todos.isEmpty
+                        ? null
+                        : () => widget.db.deleteBatch(<String>[
+                          for (final ReaxEntry<Map<String, dynamic>> t
+                              in _todos)
+                            if (t.value['completed'] as bool? ?? false) t.key,
+                        ]),
+                icon: const Icon(Icons.clear_all, size: 18),
+                label: const Text('Clear completed'),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child:
+              _todos.isEmpty
+                  ? const Center(child: Text('Nothing to do yet.'))
+                  : ListView.builder(
+                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+                    itemCount: _todos.length,
+                    itemBuilder: (BuildContext context, int index) {
+                      final ReaxEntry<Map<String, dynamic>> todo =
+                          _todos[index];
+                      final bool completed =
+                          todo.value['completed'] as bool? ?? false;
+                      return Card(
+                        margin: const EdgeInsets.only(bottom: 8),
+                        child: ListTile(
+                          leading: Checkbox(
+                            value: completed,
+                            onChanged: (_) => _toggle(todo),
+                          ),
+                          title: Text(
+                            todo.value['title'] as String? ?? '',
+                            style: TextStyle(
+                              decoration:
+                                  completed ? TextDecoration.lineThrough : null,
                             ),
                           ),
-                          const SizedBox(width: 8),
-                          ElevatedButton.icon(
-                            onPressed: () => addTodo(todoController.text),
-                            icon: const Icon(Icons.add),
-                            label: const Text('Add'),
+                          subtitle: Text(
+                            todo.key,
+                            style: const TextStyle(
+                              fontFamily: 'monospace',
+                              fontSize: 11,
+                            ),
                           ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-                
-                // Todos List
-                Expanded(
-                  child: todos.isEmpty
-                      ? Center(
-                          child: Column(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              Icon(Icons.check_circle_outline, 
-                                size: 64, 
-                                color: Colors.grey[400]),
-                              const SizedBox(height: 16),
-                              const Text('No todos yet!'),
-                              const Text('Add your first task above'),
-                            ],
+                          trailing: IconButton(
+                            icon: const Icon(Icons.delete_outline),
+                            onPressed: () => widget.db.delete(todo.key),
                           ),
-                        )
-                      : ListView.builder(
-                          padding: const EdgeInsets.symmetric(horizontal: 16),
-                          itemCount: todos.length,
-                          itemBuilder: (context, index) {
-                            final todo = todos[index];
-                            final isCompleted = todo['completed'] ?? false;
-                            
-                            return Card(
-                              margin: const EdgeInsets.only(bottom: 8),
-                              child: ListTile(
-                                leading: Checkbox(
-                                  value: isCompleted,
-                                  onChanged: (_) => toggleTodo(todo['id'], isCompleted),
-                                ),
-                                title: Text(
-                                  todo['title'] ?? '',
-                                  style: TextStyle(
-                                    decoration: isCompleted 
-                                        ? TextDecoration.lineThrough 
-                                        : null,
-                                    color: isCompleted 
-                                        ? Colors.grey 
-                                        : null,
-                                  ),
-                                ),
-                                subtitle: Text(
-                                  _formatDate(todo['createdAt']),
-                                  style: const TextStyle(fontSize: 12),
-                                ),
-                                trailing: IconButton(
-                                  icon: const Icon(Icons.delete, color: Colors.red),
-                                  onPressed: () => deleteTodo(todo['id']),
-                                ),
-                              ),
-                            );
-                          },
                         ),
-                ),
-              ],
-            ),
+                      );
+                    },
+                  ),
+        ),
+      ],
     );
-  }
-  
-  String _formatDate(String? isoDate) {
-    if (isoDate == null) return '';
-    try {
-      final date = DateTime.parse(isoDate);
-      final now = DateTime.now();
-      final diff = now.difference(date);
-      
-      if (diff.inDays == 0) {
-        if (diff.inHours == 0) {
-          if (diff.inMinutes == 0) {
-            return 'Just now';
-          }
-          return '${diff.inMinutes}m ago';
-        }
-        return '${diff.inHours}h ago';
-      } else if (diff.inDays == 1) {
-        return 'Yesterday';
-      } else if (diff.inDays < 7) {
-        return '${diff.inDays} days ago';
-      }
-      return '${date.day}/${date.month}/${date.year}';
-    } catch (_) {
-      return '';
-    }
   }
 }

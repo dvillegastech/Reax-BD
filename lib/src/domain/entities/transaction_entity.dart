@@ -1,135 +1,136 @@
-/// Entyties
-class TransactionEntity {
-  final String id;
-  final DateTime startTime;
-  final TransactionStatus status;
-  final Map<String, dynamic> readSet;
-  final Map<String, dynamic> writeSet;
-  final int isolationLevel;
+/// Value types shared by the transaction layer and the database facade.
+library;
 
-  const TransactionEntity({
-    required this.id,
-    required this.startTime,
-    required this.status,
-    required this.readSet,
-    required this.writeSet,
-    required this.isolationLevel,
-  });
+import 'dart:typed_data';
 
-  TransactionEntity copyWith({
-    String? id,
-    DateTime? startTime,
-    TransactionStatus? status,
-    Map<String, dynamic>? readSet,
-    Map<String, dynamic>? writeSet,
-    int? isolationLevel,
-  }) {
-    return TransactionEntity(
-      id: id ?? this.id,
-      startTime: startTime ?? this.startTime,
-      status: status ?? this.status,
-      readSet: readSet ?? this.readSet,
-      writeSet: writeSet ?? this.writeSet,
-      isolationLevel: isolationLevel ?? this.isolationLevel,
-    );
-  }
+/// Concurrency-control mode of a transaction.
+///
+/// The pessimistic levels use key locks; [optimistic] uses version
+/// validation at commit time instead of locks.
+enum IsolationLevel {
+  /// Reads always see the latest committed value and take no read locks.
+  /// Writes take exclusive locks held until commit/abort. Non-repeatable
+  /// reads are possible; dirty reads are not (uncommitted writes never
+  /// reach storage).
+  readCommitted,
 
-  @override
-  String toString() {
-    return 'Transaction(id: $id, status: $status, reads: ${readSet.length}, writes: ${writeSet.length})';
-  }
+  /// Reads take shared locks held until commit/abort and are served from
+  /// the transaction's read set on repeat, so a value read twice never
+  /// changes. Reads of absent keys also lock the key, blocking concurrent
+  /// inserts of that exact key.
+  repeatableRead,
+
+  /// [repeatableRead] plus commit-time validation of the full read set,
+  /// including keys that were read as absent (so "read missing key,
+  /// concurrent insert, commit" is rejected). Point reads and writes are
+  /// serializable; range/predicate phantoms are out of scope because the
+  /// transaction API has no range reads.
+  serializable,
+
+  /// No locks at all. Reads record the committed version of each key;
+  /// commit atomically re-validates every read and written key's version
+  /// and fails with a conflict if any changed since. First committer wins.
+  optimistic,
 }
 
-/// Estados de una transacción
-enum TransactionStatus { active, preparing, committed, aborted, rolledBack }
+/// Lifecycle state of a transaction.
+enum TransactionState {
+  /// Accepting operations.
+  active,
 
-/// Niveles de aislamiento de transacciones
-class IsolationLevel {
-  static const int readUncommitted = 0;
-  static const int readCommitted = 1;
-  static const int repeatableRead = 2;
-  static const int serializable = 3;
+  /// Commit in progress (validation or batch write running).
+  preparing,
+
+  /// Successfully committed; its write set is durable.
+  committed,
+
+  /// Rolled back; none of its writes were applied.
+  aborted,
 }
 
-/// Log de operaciones de una transacción
-class TransactionLog {
-  final String transactionId;
-  final List<TransactionOperation> operations;
-  final DateTime timestamp;
+/// The kind of mutation a committed transaction applied to a key.
+enum AppliedOperationType {
+  /// The key was inserted or overwritten.
+  put,
 
-  const TransactionLog({
-    required this.transactionId,
-    required this.operations,
-    required this.timestamp,
-  });
+  /// The key was removed.
+  delete,
 }
 
-/// Operación dentro de una transacción
-class TransactionOperation {
-  final OperationType type;
-  final String key;
-  final dynamic oldValue;
-  final dynamic newValue;
-  final DateTime timestamp;
-
-  const TransactionOperation({
+/// One key mutation applied by a committed transaction.
+///
+/// [key] is the exact key string that was passed to `Transaction.put` /
+/// `Transaction.delete` (the facade composes and parses any
+/// collection-prefixed key format itself). [oldValue] is the committed
+/// value that existed immediately before the transaction's batch was
+/// applied (null if the key was absent), and [newValue] is the value
+/// written (null for a delete).
+class AppliedOperation {
+  /// Creates a record of a single applied mutation.
+  const AppliedOperation({
     required this.type,
     required this.key,
     required this.oldValue,
     required this.newValue,
-    required this.timestamp,
   });
 
+  /// Whether the key was written or deleted.
+  final AppliedOperationType type;
+
+  /// The key exactly as used inside the transaction.
+  final String key;
+
+  /// Committed value before the transaction, or null if absent.
+  final Uint8List? oldValue;
+
+  /// Value written by the transaction, or null for a delete.
+  final Uint8List? newValue;
+
   @override
-  String toString() {
-    return 'Operation($type: $key)';
-  }
+  String toString() => 'AppliedOperation(${type.name} $key)';
 }
 
-/// Tipos de operaciones en transacciones
-enum OperationType { read, write, delete, create }
+/// The result of a successful transaction commit.
+///
+/// The facade consumes [operations] to invalidate caches, update secondary
+/// indexes, and emit change events for exactly the keys the transaction
+/// changed. Operations are listed in the order they were applied (last
+/// write per key; a transaction's write set holds one operation per key).
+class CommitResult {
+  /// Creates a commit result.
+  const CommitResult({required this.transactionId, required this.operations});
 
-/// Conflicto entre transacciones
-class TransactionConflict {
-  final String transaction1Id;
-  final String transaction2Id;
-  final String conflictingKey;
-  final ConflictType type;
-  final DateTime detectedAt;
+  /// Identifier of the committed transaction.
+  final int transactionId;
 
-  const TransactionConflict({
-    required this.transaction1Id,
-    required this.transaction2Id,
-    required this.conflictingKey,
-    required this.type,
-    required this.detectedAt,
-  });
+  /// Every mutation the commit applied, one entry per distinct key.
+  final List<AppliedOperation> operations;
 
   @override
-  String toString() {
-    return 'Conflict($type on $conflictingKey between $transaction1Id and $transaction2Id)';
-  }
+  String toString() =>
+      'CommitResult(tx: $transactionId, operations: ${operations.length})';
 }
 
-/// Tipos de conflictos entre transacciones
-enum ConflictType { writeWrite, readWrite, writeRead }
-
-/// Punto de guardado dentro de una transacción
-class Savepoint {
-  final String id;
-  final String transactionId;
-  final DateTime createdAt;
-  final Map<String, dynamic> state;
-
-  const Savepoint({
-    required this.id,
-    required this.transactionId,
-    required this.createdAt,
-    required this.state,
+/// Counters describing the transaction manager's activity.
+class TransactionStats {
+  /// Creates a stats snapshot.
+  const TransactionStats({
+    required this.activeTransactions,
+    required this.committedTransactions,
+    required this.abortedTransactions,
   });
 
+  /// Transactions currently active or preparing.
+  final int activeTransactions;
+
+  /// Total transactions committed since the manager was created.
+  final int committedTransactions;
+
+  /// Total transactions aborted since the manager was created.
+  final int abortedTransactions;
+
   @override
-  String toString() {
-    return 'Savepoint(id: $id, transaction: $transactionId)';
-  }
+  String toString() =>
+      'TransactionStats(active: $activeTransactions, '
+      'committed: $committedTransactions, aborted: $abortedTransactions)';
 }

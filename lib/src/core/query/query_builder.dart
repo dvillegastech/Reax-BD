@@ -1,67 +1,101 @@
+/// Fluent query building and execution.
+library;
+
+import '../errors/exceptions.dart';
 import '../indexing/index_manager.dart';
 import '../indexing/secondary_index.dart';
-import '../../reaxdb.dart';
-import '../logging/logger.dart';
 import 'aggregation.dart';
+import 'document_store.dart';
 
 /// Operators available for database queries.
 enum QueryOperator {
+  /// Field equals the value (index total order: `5` matches `5.0`,
+  /// lists and maps compare structurally, and `null` is queryable).
   equals,
+
+  /// Field differs from the value.
   notEquals,
+
+  /// Field is strictly greater than the value.
   greaterThan,
+
+  /// Field is greater than or equal to the value.
   greaterThanOrEqual,
+
+  /// Field is strictly less than the value.
   lessThan,
+
+  /// Field is less than or equal to the value.
   lessThanOrEqual,
+
+  /// Field is within `[start, end]`, both inclusive.
   between,
+
+  /// Field equals one of the listed values.
   inList,
+
+  /// String field contains the substring, or list field contains the value.
   contains,
 }
 
-/// Represents a single condition in a database query.
-class QueryCondition {
-  final String field;
-  final QueryOperator operator;
-  final dynamic value;
-
-  QueryCondition({
+/// A single condition of a query.
+final class QueryCondition {
+  /// Creates a condition comparing [field] against [value] using [operator].
+  ///
+  /// [field] may be a dotted path addressing nested maps (`address.city`).
+  const QueryCondition({
     required this.field,
     required this.operator,
     required this.value,
   });
+
+  /// Dotted path of the document field.
+  final String field;
+
+  /// Comparison operator.
+  final QueryOperator operator;
+
+  /// Value to compare against.
+  final dynamic value;
 }
 
-/// Fluent interface for building and executing database queries.
+/// Fluent interface for building and executing collection queries.
 ///
-/// Provides methods for filtering, sorting, and limiting query results.
-/// Automatically uses secondary indexes when available for optimal performance.
+/// Non-indexed queries scan the entire collection via the [DocumentStore]
+/// (which is backed by `StorageEngine.scan`), so every document is visible no
+/// matter what its id looks like. When an [IndexManager] is provided and an
+/// index can serve part of the query, candidate ids come from the index and
+/// every condition is still re-checked against the loaded documents.
+///
+/// All value comparisons - conditions, `orderBy`, aggregation - use the
+/// single total order defined in `secondary_index.dart`, so indexed and
+/// scanned execution can never disagree.
 class QueryBuilder {
+  /// Creates a query over [collection].
+  QueryBuilder({
+    required this.collection,
+    required DocumentStore store,
+    IndexManager? indexManager,
+  }) : _store = store,
+       _indexManager = indexManager;
+
+  /// The collection this query targets.
   final String collection;
-  final ReaxDB _db;
-  final IndexManager _indexManager;
+
+  final DocumentStore _store;
+  final IndexManager? _indexManager;
   final List<QueryCondition> _conditions = [];
+  final List<_JoinSpec> _joins = [];
   int? _limitValue;
   int? _offsetValue;
   String? _orderByField;
   bool _orderDescending = false;
+  bool _orderNullsLast = false;
   AggregationBuilder? _aggregationBuilder;
   String? _textSearchQuery;
   String? _textSearchField;
-  final List<String> _joinCollections = [];
-  final Map<String, String> _joinConditions = {};
 
-  /// Creates a new query builder for the specified collection.
-  QueryBuilder({
-    required this.collection,
-    required ReaxDB db,
-    required IndexManager indexManager,
-  }) : _db = db,
-       _indexManager = indexManager;
-
-  /// Adds a condition to the query.
-  ///
-  /// [field] is the document field to filter on.
-  /// [operator] specifies the comparison operation.
-  /// [value] is the value to compare against.
+  /// Adds a condition comparing [field] to [value] with [operator].
   QueryBuilder where(String field, QueryOperator operator, dynamic value) {
     _conditions.add(
       QueryCondition(field: field, operator: operator, value: value),
@@ -69,470 +103,394 @@ class QueryBuilder {
     return this;
   }
 
-  /// Adds an equality condition to the query.
-  QueryBuilder whereEquals(String field, dynamic value) {
-    return where(field, QueryOperator.equals, value);
-  }
+  /// Adds an equality condition. `value` may be null to match documents
+  /// whose field is null or missing.
+  QueryBuilder whereEquals(String field, dynamic value) =>
+      where(field, QueryOperator.equals, value);
 
-  // Where greater than
-  QueryBuilder whereGreaterThan(String field, dynamic value) {
-    return where(field, QueryOperator.greaterThan, value);
-  }
+  /// Adds an inequality condition.
+  QueryBuilder whereNotEquals(String field, dynamic value) =>
+      where(field, QueryOperator.notEquals, value);
 
-  // Where less than
-  QueryBuilder whereLessThan(String field, dynamic value) {
-    return where(field, QueryOperator.lessThan, value);
-  }
+  /// Adds a strictly-greater-than condition.
+  QueryBuilder whereGreaterThan(String field, dynamic value) =>
+      where(field, QueryOperator.greaterThan, value);
 
-  // Where between
-  QueryBuilder whereBetween(String field, dynamic start, dynamic end) {
-    return where(field, QueryOperator.between, [start, end]);
-  }
+  /// Adds a greater-than-or-equal condition.
+  QueryBuilder whereGreaterThanOrEqual(String field, dynamic value) =>
+      where(field, QueryOperator.greaterThanOrEqual, value);
 
-  // Where in
-  QueryBuilder whereIn(String field, List<dynamic> values) {
-    return where(field, QueryOperator.inList, values);
-  }
+  /// Adds a strictly-less-than condition.
+  QueryBuilder whereLessThan(String field, dynamic value) =>
+      where(field, QueryOperator.lessThan, value);
 
-  /// Specifies the field to sort results by.
+  /// Adds a less-than-or-equal condition.
+  QueryBuilder whereLessThanOrEqual(String field, dynamic value) =>
+      where(field, QueryOperator.lessThanOrEqual, value);
+
+  /// Adds an inclusive range condition.
+  QueryBuilder whereBetween(String field, dynamic start, dynamic end) =>
+      where(field, QueryOperator.between, [start, end]);
+
+  /// Adds a membership condition.
+  QueryBuilder whereIn(String field, List<dynamic> values) =>
+      where(field, QueryOperator.inList, values);
+
+  /// Adds a containment condition (substring for strings, element for lists).
+  QueryBuilder whereContains(String field, dynamic value) =>
+      where(field, QueryOperator.contains, value);
+
+  /// Sorts results by [field].
   ///
-  /// [field] is the field name to sort on.
-  /// [descending] determines sort order (default is ascending).
-  QueryBuilder orderBy(String field, {bool descending = false}) {
+  /// Nulls sort first by default (they are the smallest values in the total
+  /// order); pass [nullsLast] to move them to the end.
+  QueryBuilder orderBy(
+    String field, {
+    bool descending = false,
+    bool nullsLast = false,
+  }) {
     _orderByField = field;
     _orderDescending = descending;
+    _orderNullsLast = nullsLast;
     return this;
   }
 
-  /// Limits the number of results returned.
+  /// Limits the number of results. Must not be negative.
   QueryBuilder limit(int count) {
+    if (count < 0) {
+      throw const QueryException('limit must not be negative');
+    }
     _limitValue = count;
     return this;
   }
 
-  /// Skips the specified number of results.
+  /// Skips the first [count] results. Must not be negative.
   QueryBuilder offset(int count) {
+    if (count < 0) {
+      throw const QueryException('offset must not be negative');
+    }
     _offsetValue = count;
     return this;
   }
 
-  /// Executes the query and returns all matching documents.
-  Future<List<Map<String, dynamic>>> find() async {
-    // Text search support
-    if (_textSearchQuery != null) {
-      return await _findWithTextSearch();
-    }
-
-    // Join support
-    if (_joinCollections.isNotEmpty) {
-      return await _findWithJoins();
-    }
-    Set<String> candidateIds = {};
-    bool hasIndexedQuery = false;
-
-    for (final condition in _conditions) {
-      final index = _indexManager.getIndex(collection, condition.field);
-
-      if (index != null && _canUseIndex(condition)) {
-        hasIndexedQuery = true;
-        final indexResults = await _queryIndex(index, condition);
-
-        if (candidateIds.isEmpty) {
-          candidateIds = indexResults.toSet();
-        } else {
-          candidateIds = candidateIds.intersection(indexResults.toSet());
-        }
-
-        if (candidateIds.isEmpty) {
-          return [];
-        }
-      }
-    }
-
-    if (!hasIndexedQuery) {
-      if (_orderByField != null &&
-          _indexManager.getIndex(collection, _orderByField!) != null) {
-        final index = _indexManager.getIndex(collection, _orderByField!)!;
-
-        candidateIds = (await index.findRange(null, null)).toSet();
-      } else {
-        // Full collection scan when no index is available
-        logger.debug('Performing full collection scan for: $collection');
-        candidateIds = await _scanCollection();
-      }
-    }
-
-    final results = <Map<String, dynamic>>[];
-
-    for (final docId in candidateIds) {
-      final doc = await _loadDocument(docId);
-
-      if (doc != null && _matchesAllConditions(doc)) {
-        results.add(doc);
-      }
-    }
-
-    if (_orderByField != null) {
-      _sortResults(results);
-    }
-
-    final start = _offsetValue ?? 0;
-    final end = _limitValue != null ? start + _limitValue! : results.length;
-
-    return results.sublist(
-      start.clamp(0, results.length),
-      end.clamp(0, results.length),
-    );
-  }
-
-  /// Executes the query and returns the first matching document.
-  Future<Map<String, dynamic>?> findOne() async {
-    final results = await limit(1).find();
-    return results.isEmpty ? null : results.first;
-  }
-
-  /// Counts the number of documents matching the query.
-  Future<int> count() async {
-    final results = await find();
-    return results.length;
-  }
-
-  /// Adds text search to the query
+  /// Adds a case-insensitive text search over all string fields, or over
+  /// [field] only when given.
   QueryBuilder search(String query, {String? field}) {
     _textSearchQuery = query;
     _textSearchField = field;
     return this;
   }
 
-  /// Adds a join with another collection
+  /// Joins matching documents of [collection] where its [foreignField]
+  /// equals this query's [localField]. Matches are attached to each result
+  /// under `_joined_<collection>`.
   QueryBuilder join(String collection, String localField, String foreignField) {
-    _joinCollections.add(collection);
-    _joinConditions['$collection.$foreignField'] = localField;
+    _joins.add(_JoinSpec(collection, localField, foreignField));
     return this;
   }
 
-  /// Creates an aggregation builder
-  QueryBuilder aggregate(Function(AggregationBuilder) builder) {
+  /// Configures an aggregation to run with [executeAggregation].
+  QueryBuilder aggregate(void Function(AggregationBuilder) builder) {
     _aggregationBuilder = AggregationBuilder();
     builder(_aggregationBuilder!);
     return this;
   }
 
-  /// Executes aggregation query
-  Future<dynamic> executeAggregation() async {
-    if (_aggregationBuilder == null) {
-      throw StateError('No aggregation defined. Use aggregate() first.');
+  /// Executes the query and returns all matching documents.
+  Future<List<Map<String, dynamic>>> find() async {
+    final List<DocumentRecord> records = await _findRecords();
+    final List<Map<String, dynamic>> results = [
+      for (final DocumentRecord record in records) record.document,
+    ];
+    if (_joins.isNotEmpty) {
+      await _applyJoins(results);
     }
-
-    final documents = await find();
-    return _aggregationBuilder!.execute(documents);
+    return results;
   }
 
-  /// Gets distinct values for a field
-  Future<List<dynamic>> distinct(String field) async {
-    final documents = await find();
-    final values = <dynamic>{};
+  /// Executes the query and returns the first matching document, or null.
+  ///
+  /// Does not mutate this builder: calling [find] afterwards still returns
+  /// every match.
+  Future<Map<String, dynamic>?> findOne() async {
+    final List<DocumentRecord> records = await _findRecords(limitOverride: 1);
+    if (records.isEmpty) return null;
+    final List<Map<String, dynamic>> results = [records.first.document];
+    if (_joins.isNotEmpty) {
+      await _applyJoins(results);
+    }
+    return results.first;
+  }
 
-    for (final doc in documents) {
-      final value = _getFieldValue(doc, field);
-      if (value != null) {
+  /// Counts matching documents without materializing the result list.
+  ///
+  /// With no conditions this only iterates ids and never decodes documents.
+  Future<int> count() async {
+    if (_conditions.isEmpty && _textSearchQuery == null) {
+      int total = 0;
+      await for (final String _ in _store.scanDocumentIds(collection)) {
+        total++;
+      }
+      return _applyWindowToCount(total);
+    }
+    int matched = 0;
+    await for (final DocumentRecord _ in _matchingRecords()) {
+      matched++;
+    }
+    return _applyWindowToCount(matched);
+  }
+
+  /// Executes the configured aggregation over the matching documents.
+  Future<dynamic> executeAggregation() async {
+    final AggregationBuilder? builder = _aggregationBuilder;
+    if (builder == null) {
+      throw const QueryException(
+        'No aggregation defined. Use aggregate() first.',
+      );
+    }
+    return builder.execute(await find());
+  }
+
+  /// Returns the distinct values of [field] among matching documents.
+  ///
+  /// Distinctness follows the index total order, so `1` and `1.0` are one
+  /// value and equal lists/maps deduplicate structurally.
+  Future<List<dynamic>> distinct(String field) async {
+    final List<dynamic> values = [];
+    for (final Map<String, dynamic> doc in await find()) {
+      final dynamic value = extractFieldValue(doc, field);
+      if (value == null) continue;
+      if (!values.any((dynamic v) => valuesEqual(v, value))) {
         values.add(value);
       }
     }
-
-    return values.toList();
+    return values;
   }
 
-  /// Updates all matching documents
+  /// Applies [updates] to every matching document and returns how many were
+  /// written. Documents are addressed by the storage key they were loaded
+  /// from, never by an id reconstructed from their fields.
   Future<int> update(Map<String, dynamic> updates) async {
-    final documents = await find();
-    int updated = 0;
-
-    for (final doc in documents) {
-      final key = '$collection:${doc['id'] ?? doc['_id'] ?? _generateId()}';
-      final updatedDoc = {...doc, ...updates};
-      await _db.put(key, updatedDoc);
-      updated++;
+    final List<DocumentRecord> records = await _findRecords();
+    for (final DocumentRecord record in records) {
+      await _store.putDocument(collection, record.id, {
+        ...record.document,
+        ...updates,
+      });
     }
-
-    return updated;
+    return records.length;
   }
 
-  /// Deletes all matching documents
+  /// Deletes every matching document and returns how many were removed.
   Future<int> delete() async {
-    final documents = await find();
-    int deleted = 0;
-
-    for (final doc in documents) {
-      final key = '$collection:${doc['id'] ?? doc['_id'] ?? _generateId()}';
-      await _db.delete(key);
-      deleted++;
+    final List<DocumentRecord> records = await _findRecords();
+    for (final DocumentRecord record in records) {
+      await _store.deleteDocument(collection, record.id);
     }
-
-    return deleted;
+    return records.length;
   }
 
-  dynamic _getFieldValue(Map<String, dynamic> doc, String field) {
-    final parts = field.split('.');
-    dynamic value = doc;
+  // --- execution ---------------------------------------------------------
 
-    for (final part in parts) {
-      if (value is Map<String, dynamic>) {
-        value = value[part];
-      } else {
-        return null;
-      }
+  int _applyWindowToCount(int matched) {
+    final int afterOffset = (matched - (_offsetValue ?? 0)).clamp(0, matched);
+    final int? limitValue = _limitValue;
+    return limitValue == null
+        ? afterOffset
+        : (afterOffset > limitValue ? limitValue : afterOffset);
+  }
+
+  /// Streams matching records (unordered, no offset/limit applied).
+  Stream<DocumentRecord> _matchingRecords() async* {
+    Set<String>? candidates;
+    final IndexManager? indexManager = _indexManager;
+    if (indexManager != null && _conditions.isNotEmpty) {
+      candidates = await indexManager.candidateIds(collection, _conditions);
     }
-
-    return value;
-  }
-
-  String _generateId() {
-    return DateTime.now().microsecondsSinceEpoch.toString();
-  }
-
-  Future<Set<String>> _scanCollection() async {
-    // This is a simple implementation that scans a reasonable range of IDs
-    // In a production system, you'd want to maintain a collection manifest
-    final ids = <String>{};
-
-    // Try common ID patterns - check up to 1000 for tests
-    for (int i = 1; i <= 1000; i++) {
-      final key = '$collection:$i';
-      final value = await _db.get(key);
-      if (value != null) {
-        ids.add(i.toString());
-      }
-    }
-
-    return ids;
-  }
-
-  bool _canUseIndex(QueryCondition condition) {
-    switch (condition.operator) {
-      case QueryOperator.equals:
-      case QueryOperator.greaterThan:
-      case QueryOperator.greaterThanOrEqual:
-      case QueryOperator.lessThan:
-      case QueryOperator.lessThanOrEqual:
-      case QueryOperator.between:
-        return true;
-      default:
-        return false;
-    }
-  }
-
-  Future<List<String>> _queryIndex(
-    SecondaryIndex index,
-    QueryCondition condition,
-  ) async {
-    switch (condition.operator) {
-      case QueryOperator.equals:
-        return index.findEquals(condition.value);
-
-      case QueryOperator.greaterThan:
-      case QueryOperator.greaterThanOrEqual:
-        return index.findRange(
-          condition.value,
-          null,
-          includeStart: condition.operator == QueryOperator.greaterThanOrEqual,
+    if (candidates != null) {
+      for (final String id in candidates) {
+        final Map<String, dynamic>? doc = await _store.getDocument(
+          collection,
+          id,
         );
-
-      case QueryOperator.lessThan:
-      case QueryOperator.lessThanOrEqual:
-        return index.findRange(
-          null,
-          condition.value,
-          includeEnd: condition.operator == QueryOperator.lessThanOrEqual,
-        );
-
-      case QueryOperator.between:
-        if (condition.value is List && condition.value.length == 2) {
-          return index.findRange(
-            condition.value[0],
-            condition.value[1],
-            includeStart: true,
-            includeEnd: true,
-          );
+        if (doc != null && _matches(doc)) {
+          yield DocumentRecord(id, doc);
         }
-        return [];
-
-      default:
-        return [];
+      }
+    } else {
+      await for (final DocumentRecord record in _store.scanDocuments(
+        collection,
+      )) {
+        if (_matches(record.document)) {
+          yield record;
+        }
+      }
     }
   }
 
-  Future<Map<String, dynamic>?> _loadDocument(String docId) async {
-    final key = '$collection:$docId';
-    return await _db.get<Map<String, dynamic>>(key);
+  Future<List<DocumentRecord>> _findRecords({int? limitOverride}) async {
+    final int? effectiveLimit = limitOverride ?? _limitValue;
+    final int effectiveOffset = _offsetValue ?? 0;
+
+    final List<DocumentRecord> matched = [];
+    final bool canTerminateEarly =
+        _orderByField == null && effectiveLimit != null;
+    final int? stopAt =
+        canTerminateEarly ? effectiveOffset + effectiveLimit : null;
+
+    await for (final DocumentRecord record in _matchingRecords()) {
+      matched.add(record);
+      if (stopAt != null && matched.length >= stopAt) break;
+    }
+
+    if (_orderByField != null) {
+      _sortRecords(matched);
+    }
+
+    final int start = effectiveOffset.clamp(0, matched.length);
+    int end = matched.length;
+    if (effectiveLimit != null && start + effectiveLimit < end) {
+      end = start + effectiveLimit;
+    }
+    return matched.sublist(start, end);
   }
 
-  bool _matchesAllConditions(Map<String, dynamic> doc) {
-    for (final condition in _conditions) {
-      if (!_matchesCondition(doc, condition)) {
-        return false;
-      }
+  bool _matches(Map<String, dynamic> doc) {
+    for (final QueryCondition condition in _conditions) {
+      if (!_matchesCondition(doc, condition)) return false;
+    }
+    final String? query = _textSearchQuery;
+    if (query != null && !_matchesSearch(doc, query.toLowerCase())) {
+      return false;
     }
     return true;
   }
 
   bool _matchesCondition(Map<String, dynamic> doc, QueryCondition condition) {
-    final fieldValue = doc[condition.field];
-
+    final dynamic fieldValue = extractFieldValue(doc, condition.field);
     switch (condition.operator) {
       case QueryOperator.equals:
-        return fieldValue == condition.value;
-
+        return valuesEqual(fieldValue, condition.value);
       case QueryOperator.notEquals:
-        return fieldValue != condition.value;
-
+        return !valuesEqual(fieldValue, condition.value);
       case QueryOperator.greaterThan:
-        return _compare(fieldValue, condition.value) > 0;
-
+        return compareValues(fieldValue, condition.value) > 0;
       case QueryOperator.greaterThanOrEqual:
-        return _compare(fieldValue, condition.value) >= 0;
-
+        return compareValues(fieldValue, condition.value) >= 0;
       case QueryOperator.lessThan:
-        return _compare(fieldValue, condition.value) < 0;
-
+        return compareValues(fieldValue, condition.value) < 0;
       case QueryOperator.lessThanOrEqual:
-        return _compare(fieldValue, condition.value) <= 0;
-
+        return compareValues(fieldValue, condition.value) <= 0;
       case QueryOperator.between:
-        if (condition.value is List && condition.value.length == 2) {
-          return _compare(fieldValue, condition.value[0]) >= 0 &&
-              _compare(fieldValue, condition.value[1]) <= 0;
+        final dynamic value = condition.value;
+        if (value is! List || value.length != 2) {
+          throw const QueryException(
+            'whereBetween expects a [start, end] pair',
+          );
         }
-        return false;
-
+        return compareValues(fieldValue, value[0]) >= 0 &&
+            compareValues(fieldValue, value[1]) <= 0;
       case QueryOperator.inList:
-        return (condition.value as List).contains(fieldValue);
-
+        final dynamic values = condition.value;
+        if (values is! List) {
+          throw const QueryException('whereIn expects a List value');
+        }
+        return values.any((dynamic v) => valuesEqual(fieldValue, v));
       case QueryOperator.contains:
         if (fieldValue is String && condition.value is String) {
-          return fieldValue.contains(condition.value);
+          return fieldValue.contains(condition.value as String);
         }
         if (fieldValue is List) {
-          return fieldValue.contains(condition.value);
+          return fieldValue.any((dynamic v) => valuesEqual(v, condition.value));
         }
         return false;
     }
   }
 
-  Future<List<Map<String, dynamic>>> _findWithTextSearch() async {
-    // Clear text search to avoid infinite recursion
-    final savedQuery = _textSearchQuery;
-    final savedField = _textSearchField;
-    _textSearchQuery = null;
-    _textSearchField = null;
-
-    final allDocs = await find();
-
-    // Restore search parameters
-    _textSearchQuery = savedQuery;
-    _textSearchField = savedField;
-
-    final searchLower = savedQuery!.toLowerCase();
-    final results = <Map<String, dynamic>>[];
-
-    for (final doc in allDocs) {
-      if (_textSearchField != null) {
-        // Search in specific field
-        final value = _getFieldValue(doc, _textSearchField!);
-        if (value != null &&
-            value.toString().toLowerCase().contains(searchLower)) {
-          results.add(doc);
-        }
-      } else {
-        // Search in all string fields
-        if (_searchInDocument(doc, searchLower)) {
-          results.add(doc);
-        }
-      }
+  bool _matchesSearch(Map<String, dynamic> doc, String searchLower) {
+    final String? field = _textSearchField;
+    if (field != null) {
+      final dynamic value = extractFieldValue(doc, field);
+      return value != null &&
+          value.toString().toLowerCase().contains(searchLower);
     }
-
-    return results;
+    return _searchInMap(doc, searchLower);
   }
 
-  bool _searchInDocument(Map<String, dynamic> doc, String searchTerm) {
-    for (final value in doc.values) {
-      if (value is String && value.toLowerCase().contains(searchTerm)) {
+  bool _searchInMap(Map<String, dynamic> doc, String searchLower) {
+    for (final dynamic value in doc.values) {
+      if (value is String && value.toLowerCase().contains(searchLower)) {
         return true;
-      } else if (value is Map<String, dynamic>) {
-        if (_searchInDocument(value, searchTerm)) {
-          return true;
-        }
+      }
+      if (value is Map<String, dynamic> && _searchInMap(value, searchLower)) {
+        return true;
       }
     }
     return false;
   }
 
-  Future<List<Map<String, dynamic>>> _findWithJoins() async {
-    // Clear join parameters to avoid infinite recursion
-    final savedJoinCollections = List<String>.from(_joinCollections);
-    final savedJoinConditions = Map<String, String>.from(_joinConditions);
-    _joinCollections.clear();
-    _joinConditions.clear();
-
-    final primaryDocs = await find();
-
-    // Restore join parameters
-    _joinCollections.addAll(savedJoinCollections);
-    _joinConditions.addAll(savedJoinConditions);
-    final results = <Map<String, dynamic>>[];
-
-    for (final doc in primaryDocs) {
-      final joinedDoc = Map<String, dynamic>.from(doc);
-
-      for (final joinCollection in _joinCollections) {
-        final condition = _joinConditions[joinCollection];
-        if (condition != null) {
-          final localValue = _getFieldValue(doc, condition);
-          if (localValue != null) {
-            // Find matching documents in joined collection
-            final joinQuery = QueryBuilder(
-              collection: joinCollection,
-              db: _db,
-              indexManager: _indexManager,
-            );
-
-            final parts = condition.split('.');
-            final foreignField = parts.last;
-            final joinedDocs =
-                await joinQuery.whereEquals(foreignField, localValue).find();
-
-            if (joinedDocs.isNotEmpty) {
-              joinedDoc['_joined_$joinCollection'] = joinedDocs;
-            }
-          }
-        }
+  void _sortRecords(List<DocumentRecord> records) {
+    final String field = _orderByField!;
+    records.sort((DocumentRecord a, DocumentRecord b) {
+      final dynamic av = extractFieldValue(a.document, field);
+      final dynamic bv = extractFieldValue(b.document, field);
+      if (av == null || bv == null) {
+        if (av == null && bv == null) return 0;
+        // Null placement is absolute, unaffected by descending order.
+        final int nullResult = _orderNullsLast ? 1 : -1;
+        return av == null ? nullResult : -nullResult;
       }
-
-      results.add(joinedDoc);
-    }
-
-    return results;
-  }
-
-  int _compare(dynamic a, dynamic b) {
-    if (a == null && b == null) return 0;
-    if (a == null) return -1;
-    if (b == null) return 1;
-
-    if (a is num && b is num) {
-      return a.compareTo(b);
-    }
-
-    return a.toString().compareTo(b.toString());
-  }
-
-  void _sortResults(List<Map<String, dynamic>> results) {
-    results.sort((a, b) {
-      final aValue = a[_orderByField!];
-      final bValue = b[_orderByField!];
-
-      final comparison = _compare(aValue, bValue);
+      final int comparison = compareValues(av, bv);
       return _orderDescending ? -comparison : comparison;
     });
   }
+
+  /// Hash join: each joined collection is scanned once and bucketed by its
+  /// foreign field value, instead of one sub-query per outer row.
+  Future<void> _applyJoins(List<Map<String, dynamic>> results) async {
+    for (final _JoinSpec spec in _joins) {
+      final Map<String, List<Map<String, dynamic>>> buckets = {};
+      await for (final DocumentRecord record in _store.scanDocuments(
+        spec.collection,
+      )) {
+        final dynamic foreignValue = extractFieldValue(
+          record.document,
+          spec.foreignField,
+        );
+        if (foreignValue == null) continue;
+        final String bucketKey = _joinKey(foreignValue);
+        buckets.putIfAbsent(bucketKey, () => []).add(record.document);
+      }
+      for (int i = 0; i < results.length; i++) {
+        final dynamic localValue = extractFieldValue(
+          results[i],
+          spec.localField,
+        );
+        if (localValue == null) continue;
+        final List<Map<String, dynamic>>? matches =
+            buckets[_joinKey(localValue)];
+        if (matches != null && matches.isNotEmpty) {
+          results[i] = {...results[i], '_joined_${spec.collection}': matches};
+        }
+      }
+    }
+  }
+
+  /// Value-equality join key derived from the index encoding, so `5` joins
+  /// with `5.0` and structural values join correctly.
+  static String _joinKey(dynamic value) {
+    final StringBuffer buffer = StringBuffer();
+    for (final int byte in IndexValueCodec.encodeValue(value)) {
+      buffer.write(byte.toRadixString(16).padLeft(2, '0'));
+    }
+    return buffer.toString();
+  }
+}
+
+final class _JoinSpec {
+  const _JoinSpec(this.collection, this.localField, this.foreignField);
+
+  final String collection;
+  final String localField;
+  final String foreignField;
 }

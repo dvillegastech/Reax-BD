@@ -1,6 +1,6 @@
 name: reaxdb_dart
-description: "The fastest NoSQL database for pure Dart. 21,000+ writes/sec, instant cache reads, built-in encryption. Zero native dependencies."
-version: 1.4.1
+description: "Embedded NoSQL database for Dart. LSM storage with a write-ahead log, ACID transactions, secondary indexes, AES-256-GCM encryption, TTL and change streams. No native dependencies."
+version: 2.0.0
 homepage: https://github.com/dvillegastech/Reax-BD
 repository: https://github.com/dvillegastech/Reax-BD
 issue_tracker: https://github.com/dvillegastech/Reax-BD/issues
@@ -21,7 +21,7 @@ environment:
 dependencies:
   path: ^1.8.3
   crypto: ^3.0.3
-  # PointyCastle for native AES-256 performance (not WASM compatible)
+  # PointyCastle provides PBKDF2 and AES-256-GCM in pure Dart.
   pointycastle: ^4.0.0
 
 dev_dependencies:

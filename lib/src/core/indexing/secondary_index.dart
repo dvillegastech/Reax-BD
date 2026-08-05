@@ -1,211 +1,458 @@
+/// Index definitions and the order-preserving value codec.
+///
+/// Secondary index entries live in the same [StorageEngine] key space as
+/// documents, under a reserved prefix that begins with a 0x00 byte so it can
+/// never collide with document keys (which are UTF-8 strings of the form
+/// `collection:id` and therefore never start with 0x00).
+///
+/// One storage key exists per `(index, field values, document id)` posting, so
+/// inserting or removing a posting is O(1) and lookups are range scans. The
+/// stored value of a posting is empty; all information lives in the key.
+///
+/// ## Entry key layout
+///
+/// ```text
+/// 0x00 'i' 'd' 'x' 0x00        reserved entry prefix
+/// utf8(collection) 0x00        collection name (0x00 forbidden in names)
+/// utf8(fieldSpec)  0x00        fields joined by 0x1F (unit separator)
+/// enc(v1) .. enc(vN)           one self-delimiting encoded value per field
+/// 0x01 escaped(docId) 0x00     document id component (tag 0x01)
+/// ```
+///
+/// ## Total value ordering
+///
+/// Values of any type compare under one documented total order:
+/// `null < false < true < numbers < strings < lists < maps < other`.
+/// Numbers form a single space: `int` and `double` with the same numeric
+/// value encode identically, so `whereEquals(field, 5)` matches `5.0`.
+/// Integers with magnitude above 2^53 lose precision in this unified space;
+/// queries re-filter loaded documents, so this can only widen an index range,
+/// never produce wrong results. Strings order by UTF-8 bytes; lists compare
+/// element-wise; maps compare by sorted key/value pairs; any other type
+/// compares by its `toString()`. [compareValues] and the byte encoding agree
+/// exactly: the comparator is defined as memcmp of the encodings, so the
+/// index path and the scan path can never disagree.
+library;
+
+import 'dart:convert';
 import 'dart:typed_data';
-import '../storage/btree.dart';
-import '../storage/hybrid_storage_engine.dart';
 
-/// Secondary index for fast field-based queries
-class SecondaryIndex {
+import '../errors/exceptions.dart';
+
+/// Reserved key prefix for index entry keys: `0x00 i d x 0x00`.
+final Uint8List indexEntryPrefix = Uint8List.fromList(const [
+  0x00,
+  0x69,
+  0x64,
+  0x78,
+  0x00,
+]);
+
+/// Reserved key prefix for index metadata keys: `0x00 i d x m 0x00`.
+///
+/// Differs from [indexEntryPrefix] at byte 4 (0x6D vs 0x00), so the two key
+/// families can never overlap.
+final Uint8List indexMetaPrefix = Uint8List.fromList(const [
+  0x00,
+  0x69,
+  0x64,
+  0x78,
+  0x6D,
+  0x00,
+]);
+
+/// Separator used between field names inside an index field spec.
+const String fieldSpecSeparator = '\u001F';
+
+/// Immutable description of a (possibly compound) secondary index.
+final class IndexDefinition {
+  /// Creates an index definition over [fields] of [collection].
+  ///
+  /// Throws [QueryException] when names contain reserved characters or the
+  /// field list is empty.
+  IndexDefinition({required this.collection, required List<String> fields})
+    : fields = List.unmodifiable(fields) {
+    if (fields.isEmpty) {
+      throw const QueryException('An index needs at least one field');
+    }
+    _validateName(collection, 'collection');
+    for (final String field in fields) {
+      _validateName(field, 'field');
+    }
+  }
+
+  /// Collection the index belongs to.
   final String collection;
-  final String fieldName;
-  final BTree _indexTree;
 
-  SecondaryIndex({
-    required this.collection,
-    required this.fieldName,
-    required BTree indexTree,
-    required HybridStorageEngine storageEngine,
-  }) : _indexTree = indexTree;
+  /// Indexed fields, in significance order. Dotted paths address nested
+  /// fields (for example `address.city`).
+  final List<String> fields;
 
-  /// Creates a new secondary index
-  static Future<SecondaryIndex> create({
-    required String collection,
-    required String fieldName,
-    required String basePath,
-    required HybridStorageEngine storageEngine,
-  }) async {
-    final indexPath = '$basePath/indexes/${collection}_$fieldName';
-    final indexTree = await BTree.create(basePath: indexPath);
+  /// Canonical single-string form of [fields].
+  String get fieldSpec => fields.join(fieldSpecSeparator);
 
-    return SecondaryIndex(
-      collection: collection,
-      fieldName: fieldName,
-      indexTree: indexTree,
-      storageEngine: storageEngine,
-    );
-  }
+  /// Human readable name, for example `users.age` or `users.city+age`.
+  String get name => '$collection.${fields.join('+')}';
 
-  /// Adds an entry to the index
-  Future<void> addEntry(dynamic fieldValue, String documentId) async {
-    final indexKey = _createIndexKey(fieldValue);
-
-    // Get existing entries for this field value
-    final existingBytes = await _indexTree.get(indexKey);
-    final documentIds = <String>[];
-
-    if (existingBytes != null) {
-      // Parse existing document IDs
-      documentIds.addAll(_parseDocumentIds(existingBytes));
+  static void _validateName(String value, String what) {
+    if (value.isEmpty) {
+      throw QueryException('Index $what name must not be empty');
     }
-
-    // Add new document ID if not already present
-    if (!documentIds.contains(documentId)) {
-      documentIds.add(documentId);
-
-      // Store updated list
-      final updatedBytes = _serializeDocumentIds(documentIds);
-      await _indexTree.put(indexKey, updatedBytes);
+    if (value.contains('\u0000') || value.contains(fieldSpecSeparator)) {
+      throw QueryException(
+        'Index $what name "$value" contains a reserved character',
+      );
     }
   }
 
-  /// Removes an entry from the index
-  Future<void> removeEntry(dynamic fieldValue, String documentId) async {
-    final indexKey = _createIndexKey(fieldValue);
-    final existingBytes = await _indexTree.get(indexKey);
+  @override
+  bool operator ==(Object other) =>
+      other is IndexDefinition &&
+      other.collection == collection &&
+      other.fieldSpec == fieldSpec;
 
-    if (existingBytes == null) return;
+  @override
+  int get hashCode => Object.hash(collection, fieldSpec);
 
-    final documentIds = _parseDocumentIds(existingBytes);
-    documentIds.remove(documentId);
+  @override
+  String toString() => 'IndexDefinition($name)';
+}
 
-    if (documentIds.isEmpty) {
-      // Remove the index entry completely
-      await _indexTree.delete(indexKey);
+/// Reads the value at dotted [path] from [document].
+///
+/// Returns null when any segment is missing or a non-map is traversed. Both
+/// the index writer and the query scanner use this extractor, so nested
+/// fields behave identically on either path.
+dynamic extractFieldValue(Map<String, dynamic> document, String path) {
+  dynamic value = document;
+  for (final String part in path.split('.')) {
+    if (value is Map<String, dynamic>) {
+      value = value[part];
+    } else if (value is Map) {
+      value = value[part];
     } else {
-      // Update with remaining document IDs
-      final updatedBytes = _serializeDocumentIds(documentIds);
-      await _indexTree.put(indexKey, updatedBytes);
+      return null;
     }
   }
+  return value;
+}
 
-  /// Updates an index entry when a document's field value changes
-  Future<void> updateEntry(
-    dynamic oldValue,
-    dynamic newValue,
-    String documentId,
-  ) async {
-    if (oldValue != newValue) {
-      await removeEntry(oldValue, documentId);
-      await addEntry(newValue, documentId);
-    }
+/// Order-preserving binary encoding for index component values.
+///
+/// Encodings are self-delimiting and compare bytewise exactly as
+/// [compareValues] compares the source values.
+final class IndexValueCodec {
+  IndexValueCodec._();
+
+  /// Component tag for the document id trailer.
+  static const int docIdTag = 0x01;
+
+  /// Tag for null / missing values (they are indexed, so `field == null`
+  /// queries can be served by an index).
+  static const int tagNull = 0x05;
+
+  /// Tag for boolean false.
+  static const int tagFalse = 0x10;
+
+  /// Tag for boolean true.
+  static const int tagTrue = 0x11;
+
+  /// Tag for numbers (int and double share one comparable space).
+  static const int tagNumber = 0x20;
+
+  /// Tag for UTF-8 strings.
+  static const int tagString = 0x30;
+
+  /// Tag for lists.
+  static const int tagList = 0x40;
+
+  /// Tag for maps.
+  static const int tagMap = 0x50;
+
+  /// Tag for any other type, encoded via `toString()`.
+  static const int tagOther = 0x60;
+
+  /// Exclusive upper bound over all value tags (used to build range ends
+  /// that exclude longer-string continuations, which start with 0xFF).
+  static const int valueTagUpperBound = 0x61;
+
+  /// Sentinel byte greater than every component tag but below the 0xFF
+  /// escape continuation, used for inclusive/exclusive range boundaries.
+  static const int boundarySentinel = 0xFE;
+
+  /// Encodes [value] into its order-preserving byte form.
+  static Uint8List encodeValue(dynamic value) {
+    final BytesBuilder out = BytesBuilder(copy: false);
+    writeValue(out, value);
+    return out.toBytes();
   }
 
-  /// Finds all documents with the given field value
-  Future<List<String>> findEquals(dynamic value) async {
-    final indexKey = _createIndexKey(value);
-    final bytes = await _indexTree.get(indexKey);
-
-    if (bytes == null) return [];
-    return _parseDocumentIds(bytes);
-  }
-
-  /// Finds all documents with field values in a range
-  Future<List<String>> findRange(
-    dynamic startValue,
-    dynamic endValue, {
-    bool includeStart = true,
-    bool includeEnd = true,
-  }) async {
-    final startKey = startValue != null ? _createIndexKey(startValue) : null;
-    final endKey = endValue != null ? _createIndexKey(endValue) : null;
-
-    final documentIds = <String>{};
-
-    // Get all entries in range from B+Tree
-    await _indexTree.scan(
-      startKey: startKey,
-      endKey: endKey,
-      callback: (key, value) {
-        final docs = _parseDocumentIds(value);
-        documentIds.addAll(docs);
-
-        return true; // Continue scanning
-      },
-    );
-
-    return documentIds.toList();
-  }
-
-  /// Creates an index key from a field value
-  List<int> _createIndexKey(dynamic value) {
-    // Convert different types to bytes
+  /// Appends the encoding of [value] to [out].
+  static void writeValue(BytesBuilder out, dynamic value) {
     if (value == null) {
-      return [0]; // Null marker
-    } else if (value is String) {
-      return [1, ...value.codeUnits];
-    } else if (value is int) {
-      return [2, ..._intToBytes(value)];
-    } else if (value is double) {
-      return [3, ..._doubleToBytes(value)];
+      out.addByte(tagNull);
     } else if (value is bool) {
-      return [4, value ? 1 : 0];
+      out.addByte(value ? tagTrue : tagFalse);
+    } else if (value is num) {
+      out.addByte(tagNumber);
+      out.add(_encodeNumber(value.toDouble()));
+    } else if (value is String) {
+      out.addByte(tagString);
+      _writeEscaped(out, utf8.encode(value));
+      out.addByte(0x00);
+    } else if (value is List) {
+      out.addByte(tagList);
+      for (final dynamic element in value) {
+        writeValue(out, element);
+      }
+      out.addByte(0x00);
+    } else if (value is Map) {
+      out.addByte(tagMap);
+      final List<String> keys =
+          value.keys.map((dynamic k) => k.toString()).toList()..sort();
+      for (final String key in keys) {
+        writeValue(out, key);
+        writeValue(out, value[key]);
+      }
+      out.addByte(0x00);
     } else {
-      // Fallback to string representation
-      return [255, ...value.toString().codeUnits];
+      out.addByte(tagOther);
+      _writeEscaped(out, utf8.encode(value.toString()));
+      out.addByte(0x00);
     }
   }
 
-  List<int> _intToBytes(int value) {
-    final bytes = Uint8List(8);
-    bytes.buffer.asByteData().setInt64(0, value, Endian.big);
-    return bytes;
+  /// Appends the document id trailer for [docId] to [out].
+  static void writeDocId(BytesBuilder out, String docId) {
+    out.addByte(docIdTag);
+    _writeEscaped(out, utf8.encode(docId));
+    out.addByte(0x00);
   }
 
-  List<int> _doubleToBytes(double value) {
-    final bytes = Uint8List(8);
-    bytes.buffer.asByteData().setFloat64(0, value, Endian.big);
-    return bytes;
-  }
-
-  /// Serializes a list of document IDs
-  Uint8List _serializeDocumentIds(List<String> documentIds) {
-    final buffer = BytesBuilder();
-
-    // Write count
-    buffer.add(_intToBytes(documentIds.length).sublist(4)); // 4 bytes for count
-
-    // Write each document ID
-    for (final id in documentIds) {
-      final idBytes = id.codeUnits;
-      buffer.add(_intToBytes(idBytes.length).sublist(4)); // 4 bytes for length
-      buffer.add(idBytes);
+  /// Returns the offset just past the encoded value starting at [offset].
+  ///
+  /// Throws [CorruptionException] when the bytes are not a valid encoding.
+  static int skipValue(Uint8List bytes, int offset) {
+    if (offset >= bytes.length) {
+      throw const CorruptionException('Truncated index value encoding');
     }
-
-    return buffer.toBytes();
-  }
-
-  /// Parses document IDs from bytes
-  List<String> _parseDocumentIds(Uint8List bytes) {
-    final documentIds = <String>[];
-    int offset = 0;
-
-    // Read count
-    final count = bytes.buffer.asByteData().getUint32(offset, Endian.big);
-    offset += 4;
-
-    // Read each document ID
-    for (int i = 0; i < count; i++) {
-      final length = bytes.buffer.asByteData().getUint32(offset, Endian.big);
-      offset += 4;
-
-      final idBytes = bytes.sublist(offset, offset + length);
-      documentIds.add(String.fromCharCodes(idBytes));
-      offset += length;
+    final int tag = bytes[offset];
+    switch (tag) {
+      case tagNull:
+      case tagFalse:
+      case tagTrue:
+        return offset + 1;
+      case tagNumber:
+        if (offset + 9 > bytes.length) {
+          throw const CorruptionException('Truncated index number encoding');
+        }
+        return offset + 9;
+      case tagString:
+      case tagOther:
+        return _skipEscaped(bytes, offset + 1);
+      case tagList:
+        int cursor = offset + 1;
+        while (true) {
+          if (cursor >= bytes.length) {
+            throw const CorruptionException('Truncated index list encoding');
+          }
+          if (bytes[cursor] == 0x00) {
+            return cursor + 1;
+          }
+          cursor = skipValue(bytes, cursor);
+        }
+      case tagMap:
+        int cursor = offset + 1;
+        while (true) {
+          if (cursor >= bytes.length) {
+            throw const CorruptionException('Truncated index map encoding');
+          }
+          if (bytes[cursor] == 0x00) {
+            return cursor + 1;
+          }
+          cursor = skipValue(bytes, cursor);
+        }
+      default:
+        throw CorruptionException(
+          'Unknown index value tag 0x'
+          '${tag.toRadixString(16)}',
+        );
     }
-
-    return documentIds;
   }
 
-  /// Rebuilds the entire index from scratch
-  Future<void> rebuild() async {
-    // Clear existing index
-    await _indexTree.clear();
-
-    // For now, we'll rely on documents being added individually
-    // In a real implementation, we would scan all keys with the collection prefix
-    // from the storage engine and rebuild the index
+  /// Decodes the document id trailer that starts at [offset] in [key].
+  static String decodeDocIdAt(Uint8List key, int offset) {
+    if (offset >= key.length || key[offset] != docIdTag) {
+      throw const CorruptionException('Missing document id in index key');
+    }
+    final BytesBuilder out = BytesBuilder(copy: false);
+    int cursor = offset + 1;
+    while (true) {
+      if (cursor >= key.length) {
+        throw const CorruptionException('Truncated document id in index key');
+      }
+      final int byte = key[cursor];
+      if (byte == 0x00) {
+        if (cursor + 1 < key.length && key[cursor + 1] == 0xFF) {
+          out.addByte(0x00);
+          cursor += 2;
+          continue;
+        }
+        return utf8.decode(out.toBytes());
+      }
+      out.addByte(byte);
+      cursor++;
+    }
   }
 
-  /// Closes the index
-  Future<void> close() async {
-    await _indexTree.close();
+  /// Encodes a double so that its big-endian bytes sort in numeric order.
+  ///
+  /// Positive values flip the sign bit; negative values invert all bits
+  /// (the standard total-order transform for IEEE-754).
+  static Uint8List _encodeNumber(double value) {
+    final ByteData data = ByteData(8)..setFloat64(0, value, Endian.big);
+    if (data.getUint8(0) & 0x80 != 0) {
+      for (int i = 0; i < 8; i++) {
+        data.setUint8(i, ~data.getUint8(i) & 0xFF);
+      }
+    } else {
+      data.setUint8(0, data.getUint8(0) ^ 0x80);
+    }
+    return data.buffer.asUint8List();
+  }
+
+  /// Writes [bytes] escaping 0x00 as `0x00 0xFF` (order preserving).
+  static void _writeEscaped(BytesBuilder out, List<int> bytes) {
+    for (final int byte in bytes) {
+      if (byte == 0x00) {
+        out.addByte(0x00);
+        out.addByte(0xFF);
+      } else {
+        out.addByte(byte);
+      }
+    }
+  }
+
+  static int _skipEscaped(Uint8List bytes, int offset) {
+    int cursor = offset;
+    while (true) {
+      if (cursor >= bytes.length) {
+        throw const CorruptionException('Truncated escaped index bytes');
+      }
+      if (bytes[cursor] == 0x00) {
+        if (cursor + 1 < bytes.length && bytes[cursor + 1] == 0xFF) {
+          cursor += 2;
+          continue;
+        }
+        return cursor + 1;
+      }
+      cursor++;
+    }
+  }
+}
+
+/// Compares [a] and [b] under the documented total order.
+///
+/// Defined as an unsigned bytewise comparison of the two encodings, so this
+/// comparator and the on-disk index ordering can never diverge.
+int compareValues(dynamic a, dynamic b) {
+  if (identical(a, b)) return 0;
+  return compareBytes(
+    IndexValueCodec.encodeValue(a),
+    IndexValueCodec.encodeValue(b),
+  );
+}
+
+/// Returns true when [a] and [b] are equal under the index total order
+/// (structural equality for lists/maps, `5 == 5.0` for numbers).
+bool valuesEqual(dynamic a, dynamic b) => compareValues(a, b) == 0;
+
+/// Unsigned lexicographic comparison of two byte strings.
+int compareBytes(Uint8List a, Uint8List b) {
+  final int length = a.length < b.length ? a.length : b.length;
+  for (int i = 0; i < length; i++) {
+    final int diff = a[i] - b[i];
+    if (diff != 0) return diff;
+  }
+  return a.length - b.length;
+}
+
+/// Builders for the reserved index key space.
+final class IndexKeyCodec {
+  IndexKeyCodec._();
+
+  /// Key head shared by every entry of [definition]:
+  /// prefix + collection + 0x00 + fieldSpec + 0x00.
+  static Uint8List entryHead(IndexDefinition definition) {
+    final BytesBuilder out = BytesBuilder(copy: false);
+    out.add(indexEntryPrefix);
+    out.add(utf8.encode(definition.collection));
+    out.addByte(0x00);
+    out.add(utf8.encode(definition.fieldSpec));
+    out.addByte(0x00);
+    return out.toBytes();
+  }
+
+  /// Full posting key for [values] (one per index field) and [docId].
+  static Uint8List entryKey(
+    IndexDefinition definition,
+    List<dynamic> values,
+    String docId,
+  ) {
+    if (values.length != definition.fields.length) {
+      throw QueryException(
+        'Index ${definition.name} expects ${definition.fields.length} values, '
+        'got ${values.length}',
+      );
+    }
+    final BytesBuilder out = BytesBuilder(copy: false);
+    out.add(entryHead(definition));
+    for (final dynamic value in values) {
+      IndexValueCodec.writeValue(out, value);
+    }
+    IndexValueCodec.writeDocId(out, docId);
+    return out.toBytes();
+  }
+
+  /// Metadata key that persists the existence of [definition].
+  static Uint8List metaKey(IndexDefinition definition) {
+    final BytesBuilder out = BytesBuilder(copy: false);
+    out.add(indexMetaPrefix);
+    out.add(utf8.encode(definition.collection));
+    out.addByte(0x00);
+    out.add(utf8.encode(definition.fieldSpec));
+    return out.toBytes();
+  }
+
+  /// Extracts the document id from posting key [key] of [definition].
+  static String docIdFromEntryKey(IndexDefinition definition, Uint8List key) {
+    int offset = entryHead(definition).length;
+    for (int i = 0; i < definition.fields.length; i++) {
+      offset = IndexValueCodec.skipValue(key, offset);
+    }
+    return IndexValueCodec.decodeDocIdAt(key, offset);
+  }
+
+  /// Returns [bytes] plus one extra [suffix] byte.
+  static Uint8List withSuffix(Uint8List bytes, int suffix) {
+    final Uint8List out = Uint8List(bytes.length + 1);
+    out.setAll(0, bytes);
+    out[bytes.length] = suffix;
+    return out;
+  }
+
+  /// Smallest key strictly greater than every key having [prefix].
+  ///
+  /// Returns null when no such key exists (all bytes are 0xFF).
+  static Uint8List? prefixUpperBound(Uint8List prefix) {
+    for (int i = prefix.length - 1; i >= 0; i--) {
+      if (prefix[i] != 0xFF) {
+        final Uint8List out = Uint8List(i + 1);
+        out.setRange(0, i + 1, prefix);
+        out[i] = prefix[i] + 1;
+        return out;
+      }
+    }
+    return null;
   }
 }

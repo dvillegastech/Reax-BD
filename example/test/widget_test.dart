@@ -1,138 +1,161 @@
-// Comprehensive widget tests for ReaxDB Example App
+// Widget tests for the ReaxDB example.
 //
-// These tests verify the UI components and user interactions
-// without requiring actual database operations.
+// These cover the parts of the app that do not touch the file system. The
+// database code the demos are built from is exercised in
+// `database_service_test.dart`.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:reaxdb_dart/reaxdb_dart.dart';
 import 'package:reaxdb_example/main.dart';
+import 'package:reaxdb_example/widgets/console_widget.dart';
+import 'package:reaxdb_example/widgets/demo_scaffold.dart';
+import 'package:reaxdb_example/widgets/stats_card.dart';
 
 void main() {
-  group('ReaxDB Example App Widget Tests', () {
-    testWidgets('should display app title and main components', (
-      WidgetTester tester,
-    ) async {
-      await tester.pumpWidget(ReaxDBExampleApp());
-      await tester.pump(); // Allow for initial frame
+  group('catalogue', () {
+    testWidgets('lists the demos', (WidgetTester tester) async {
+      await tester.pumpWidget(const ReaxDBExampleApp());
+      await tester.pump();
 
-      // Verify app structure
       expect(find.text('ReaxDB Example'), findsOneWidget);
-      expect(find.byType(AppBar), findsOneWidget);
-      expect(find.byType(Scaffold), findsOneWidget);
+      expect(find.text('Overview'), findsOneWidget);
+      expect(find.text('Typed collections'), findsOneWidget);
+      expect(find.byType(ListTile), findsWidgets);
     });
 
-    testWidgets('should show loading indicator initially', (
+    testWidgets('every demo has a summary and an API line', (
       WidgetTester tester,
     ) async {
-      await tester.pumpWidget(ReaxDBExampleApp());
-
-      // Should show loading indicator while database initializes
-      expect(find.byType(CircularProgressIndicator), findsOneWidget);
-    });
-
-    testWidgets('should display database operations panel after loading', (
-      WidgetTester tester,
-    ) async {
-      await tester.pumpWidget(ReaxDBExampleApp());
-
-      // Wait for potential async operations (but not actual DB initialization)
-      await tester.pump(Duration(milliseconds: 100));
-
-      // Note: In a real app, we might need to mock the database
-      // For now, we're testing the UI structure
-    });
-
-    testWidgets('should have input fields for key and value', (
-      WidgetTester tester,
-    ) async {
-      await tester.pumpWidget(ReaxDBExampleApp());
+      await tester.pumpWidget(const ReaxDBExampleApp());
       await tester.pump();
 
-      // The TextFields might not be visible yet due to loading state
-      // In a production test, we'd mock the database initialization
+      for (final Demo demo in demos) {
+        expect(demo.summary, isNotEmpty, reason: demo.title);
+        expect(demo.api, isNotEmpty, reason: demo.title);
+      }
+      expect(demos, hasLength(10));
     });
 
-    testWidgets('should have action buttons', (WidgetTester tester) async {
-      await tester.pumpWidget(ReaxDBExampleApp());
+    testWidgets('scrolls to the last demo', (WidgetTester tester) async {
+      await tester.pumpWidget(const ReaxDBExampleApp());
       await tester.pump();
 
-      // Note: These buttons might not be visible during loading state
-      // In production, we'd use dependency injection to mock the database
-    });
-
-    testWidgets('should have proper theme configuration', (
-      WidgetTester tester,
-    ) async {
-      await tester.pumpWidget(ReaxDBExampleApp());
-
-      final MaterialApp materialApp = tester.widget(find.byType(MaterialApp));
-
-      expect(materialApp.title, equals('ReaxDB Example'));
-      expect(materialApp.theme, isNotNull);
-      expect(
-        materialApp.theme?.visualDensity,
-        equals(VisualDensity.adaptivePlatformDensity),
+      await tester.dragUntilVisible(
+        find.text('Chat'),
+        find.byType(ListView),
+        const Offset(0, -200),
       );
-    });
-
-    testWidgets('should handle widget disposal properly', (
-      WidgetTester tester,
-    ) async {
-      await tester.pumpWidget(ReaxDBExampleApp());
-      await tester.pump();
-
-      // Navigate away (simulating app lifecycle)
-      await tester.pumpWidget(Container());
-
-      // Verify no errors during disposal
-      // The actual database close would be tested in integration tests
+      expect(find.text('Chat'), findsOneWidget);
     });
   });
 
-  group('Database Example Screen Widget Tests', () {
-    testWidgets('should create DatabaseExampleScreen widget', (
-      WidgetTester tester,
-    ) async {
-      await tester.pumpWidget(MaterialApp(home: DatabaseExampleScreen()));
+  group('ConsoleController', () {
+    test('appends lines with a tone and clears them', () {
+      final ConsoleController controller = ConsoleController();
+      addTearDown(controller.dispose);
 
-      expect(find.byType(DatabaseExampleScreen), findsOneWidget);
+      controller.info('one');
+      controller.success('two');
+      controller.failure('three');
+
+      expect(controller.value, hasLength(3));
+      expect(controller.value.last.tone, LogTone.failure);
+
+      controller.clear();
+      expect(controller.value, isEmpty);
     });
 
-    testWidgets('should handle text field focus and input', (
-      WidgetTester tester,
-    ) async {
-      await tester.pumpWidget(MaterialApp(home: DatabaseExampleScreen()));
-      await tester.pump();
+    test('section separates groups with a blank line', () {
+      final ConsoleController controller = ConsoleController();
+      addTearDown(controller.dispose);
 
-      // Note: TextFields might not be visible during loading
-      // In production, we'd mock the database initialization
+      controller.section('first');
+      expect(controller.value, hasLength(1));
+
+      controller.section('second');
+      expect(controller.value, hasLength(3));
+      expect(controller.value[1].text, isEmpty);
     });
   });
 
-  group('Error Handling Widget Tests', () {
-    testWidgets('should handle widget rebuilds gracefully', (
+  group('shared widgets', () {
+    testWidgets('ConsoleWidget renders lines and clears on demand', (
       WidgetTester tester,
     ) async {
-      await tester.pumpWidget(ReaxDBExampleApp());
+      final ConsoleController controller = ConsoleController();
+      addTearDown(controller.dispose);
+      controller.success('write acknowledged');
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(body: ConsoleWidget(controller: controller)),
+        ),
+      );
+
+      expect(find.textContaining('write acknowledged'), findsOneWidget);
+
+      await tester.tap(find.byTooltip('Clear output'));
       await tester.pump();
 
-      // Trigger a rebuild
-      await tester.pumpWidget(ReaxDBExampleApp());
-      await tester.pump();
-
-      // Should not throw any errors
-      expect(find.byType(MaterialApp), findsOneWidget);
+      expect(find.textContaining('write acknowledged'), findsNothing);
+      expect(find.text('Run an action to see output here.'), findsOneWidget);
     });
 
-    testWidgets('should handle rapid taps without crashing', (
+    testWidgets('StatsCard shows every statistic', (WidgetTester tester) async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(
+            body: StatsCard(
+              title: 'Cache',
+              stats: <Stat>[Stat('Hits', '12'), Stat('Misses', '3')],
+            ),
+          ),
+        ),
+      );
+
+      expect(find.text('Cache'), findsOneWidget);
+      expect(find.text('Hits'), findsOneWidget);
+      expect(find.text('12'), findsOneWidget);
+    });
+
+    testWidgets('ErrorCard names the typed exception', (
       WidgetTester tester,
     ) async {
-      await tester.pumpWidget(ReaxDBExampleApp());
-      await tester.pump();
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(
+            body: ErrorCard(
+              error: DatabaseLockedException('already open', path: '/tmp/db'),
+            ),
+          ),
+        ),
+      );
 
-      // In a real test with mocked database, we'd test rapid button taps
-      // For now, we ensure the widget structure is stable
-      expect(find.byType(ReaxDBExampleApp), findsOneWidget);
+      expect(find.text('DatabaseLockedException'), findsOneWidget);
+      expect(find.text('already open'), findsOneWidget);
+    });
+
+    testWidgets('DemoScaffold shows the description and the snippet', (
+      WidgetTester tester,
+    ) async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: DemoScaffold(
+            title: 'Iteration',
+            description: 'Ordered iteration over the key space.',
+            snippet: "await db.scanPrefix('city:');",
+            child: SizedBox.shrink(),
+          ),
+        ),
+      );
+
+      expect(find.text('Iteration'), findsOneWidget);
+      expect(
+        find.text('Ordered iteration over the key space.'),
+        findsOneWidget,
+      );
+      expect(find.text("await db.scanPrefix('city:');"), findsOneWidget);
     });
   });
 }

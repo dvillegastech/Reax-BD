@@ -1,349 +1,433 @@
-import 'dart:typed_data';
+/// ACID transactions on top of the storage engine.
+///
+/// Buffered writes (read-your-own-writes), pessimistic locking with lock
+/// upgrade and deadlock detection, an optimistic mode with version
+/// validation, and atomic commit through [StorageEngine.writeBatch] so a
+/// crash mid-commit can never persist a partial write set.
+library;
+
 import 'dart:async';
-import '../../domain/entities/database_entity.dart';
-import '../storage/hybrid_storage_engine.dart';
+import 'dart:convert';
+import 'dart:typed_data';
 
-// Transaction isolation levels
-enum IsolationLevel {
-  readUncommitted,
-  readCommitted,
-  repeatableRead,
-  serializable,
-}
+import '../../domain/entities/transaction_entity.dart';
+import '../errors/exceptions.dart';
+import '../storage/storage_engine.dart';
+import 'lock_manager.dart';
 
-// Transaction states
-enum TransactionState { active, committed, aborted, preparing, prepared }
+export '../../domain/entities/transaction_entity.dart';
+export 'lock_manager.dart' show LockManager, LockType;
 
-// Lock types
-enum LockType { shared, exclusive }
+/// A buffered write inside a transaction's write set.
+class _PendingWrite {
+  _PendingWrite.put(Uint8List this.value);
+  _PendingWrite.delete() : value = null;
 
-// Lock entry
-class LockEntry {
-  final String transactionId;
-  final LockType type;
-  final DateTime acquiredAt;
-
-  LockEntry({
-    required this.transactionId,
-    required this.type,
-    required this.acquiredAt,
-  });
-}
-
-// Lock manager
-class LockManager {
-  final Map<String, List<LockEntry>> _locks = {};
-  final Map<String, Completer<void>> _waitingQueue = {};
-
-  // Acquires lock
-  Future<bool> acquireLock(
-    String key,
-    String transactionId,
-    LockType type,
-  ) async {
-    if (_canGrantLock(key, transactionId, type)) {
-      _grantLock(key, transactionId, type);
-      return true;
-    }
-
-    final completer = Completer<void>();
-    _waitingQueue['${key}_$transactionId'] = completer;
-
-    try {
-      await completer.future.timeout(Duration(seconds: 30));
-      if (_canGrantLock(key, transactionId, type)) {
-        _grantLock(key, transactionId, type);
-        return true;
-      }
-      return false;
-    } catch (e) {
-      _waitingQueue.remove('${key}_$transactionId');
-      return false;
-    }
-  }
-
-  // Releases locks
-  void releaseLocks(String transactionId) {
-    final keysToRemove = <String>[];
-
-    for (final entry in _locks.entries) {
-      entry.value.removeWhere((lock) => lock.transactionId == transactionId);
-      if (entry.value.isEmpty) {
-        keysToRemove.add(entry.key);
-      }
-    }
-
-    for (final key in keysToRemove) {
-      _locks.remove(key);
-      _notifyWaiters(key);
-    }
-  }
-
-  // Checks if holds lock
-  bool holdsLock(String key, String transactionId, LockType type) {
-    final locks = _locks[key] ?? [];
-    return locks.any(
-      (lock) =>
-          lock.transactionId == transactionId &&
-          (lock.type == type || lock.type == LockType.exclusive),
-    );
-  }
-
-  bool _canGrantLock(String key, String transactionId, LockType type) {
-    final existingLocks = _locks[key] ?? [];
-
-    if (existingLocks.isEmpty) return true;
-
-    final ownLocks = existingLocks.where(
-      (l) => l.transactionId == transactionId,
-    );
-    if (ownLocks.isNotEmpty) {
-      return ownLocks.any(
-        (l) => l.type == LockType.exclusive || type == LockType.shared,
-      );
-    }
-
-    if (type == LockType.shared) {
-      return existingLocks.every((l) => l.type == LockType.shared);
-    } else {
-      return false;
-    }
-  }
-
-  void _grantLock(String key, String transactionId, LockType type) {
-    final locks = _locks.putIfAbsent(key, () => []);
-    locks.add(
-      LockEntry(
-        transactionId: transactionId,
-        type: type,
-        acquiredAt: DateTime.now(),
-      ),
-    );
-  }
-
-  void _notifyWaiters(String key) {
-    final waitersToNotify = <Completer<void>>[];
-
-    for (final entry in _waitingQueue.entries) {
-      if (entry.key.startsWith('${key}_')) {
-        waitersToNotify.add(entry.value);
-      }
-    }
-
-    for (final waiter in waitersToNotify) {
-      if (!waiter.isCompleted) {
-        waiter.complete();
-      }
-    }
-  }
-}
-
-// Transaction operation
-class TransactionOperation {
-  final String type;
-  final String key;
+  /// The value to write, or null for a delete.
   final Uint8List? value;
-  final DateTime timestamp;
 
-  TransactionOperation({
-    required this.type,
-    required this.key,
-    this.value,
-    required this.timestamp,
-  });
+  bool get isDelete => value == null;
 }
 
-// MVCC version
-class MVCCVersion {
-  final Uint8List value;
-  final String transactionId;
-  final DateTime timestamp;
-  final bool isDeleted;
+/// Serializes async critical sections in FIFO order.
+class _AsyncMutex {
+  Future<void> _tail = Future<void>.value();
 
-  MVCCVersion({
-    required this.value,
-    required this.transactionId,
-    required this.timestamp,
-    this.isDeleted = false,
-  });
+  /// Runs [action] after all previously scheduled actions complete.
+  Future<T> run<T>(Future<T> Function() action) async {
+    final Future<void> previous = _tail;
+    final Completer<void> gate = Completer<void>();
+    _tail = gate.future;
+    await previous;
+    try {
+      return await action();
+    } finally {
+      gate.complete();
+    }
+  }
 }
 
-// Transaction
-class Transaction {
-  final String id;
-  final IsolationLevel isolationLevel;
-  final DateTime startTime;
-  final HybridStorageEngine _storageEngine;
-  final LockManager _lockManager;
-
-  TransactionState _state = TransactionState.active;
-  final Map<String, TransactionOperation> _writeSet = {};
-  final Map<String, MVCCVersion> _readSet = {};
-  final List<TransactionOperation> _operationLog = [];
-
-  Transaction({
+/// A single database transaction.
+///
+/// Obtain instances from [TransactionManager.begin] (or, preferably,
+/// [TransactionManager.runTransaction] which handles commit, abort and
+/// retries). Writes are buffered in the transaction and become visible to
+/// other transactions only after commit; within the transaction, [get]
+/// always observes the transaction's own pending writes.
+///
+/// Operations on a transaction that is no longer [TransactionState.active]
+/// throw [TransactionConflictException]. If a lock acquisition fails
+/// (deadlock or timeout) the transaction is aborted automatically and all
+/// its locks are released before the exception propagates.
+final class Transaction {
+  Transaction._({
     required this.id,
     required this.isolationLevel,
-    required HybridStorageEngine storageEngine,
-    required LockManager lockManager,
-  }) : startTime = DateTime.now(),
-       _storageEngine = storageEngine,
-       _lockManager = lockManager;
+    required TransactionManager manager,
+  }) : _manager = manager;
 
-  // Gets value
-  Future<Uint8List?> get(String key) async {
-    if (_state != TransactionState.active) {
-      throw StateError('Transaction is not active');
-    }
+  /// Monotonically increasing transaction identifier (lower id = older).
+  final int id;
 
-    final keyBytes = key.codeUnits;
+  /// Concurrency-control mode this transaction runs under.
+  final IsolationLevel isolationLevel;
 
-    final writeOp = _writeSet[key];
-    if (writeOp != null) {
-      return writeOp.type == 'delete' ? null : writeOp.value;
-    }
+  final TransactionManager _manager;
 
-    if (isolationLevel != IsolationLevel.readUncommitted) {
-      final lockAcquired = await _lockManager.acquireLock(
-        key,
-        id,
-        LockType.shared,
-      );
-      if (!lockAcquired) {
-        throw Exception('Failed to acquire read lock for key: $key');
-      }
-    }
+  TransactionState _state = TransactionState.active;
 
-    final value = await _storageEngine.get(keyBytes);
+  /// Buffered mutations, one per key, in first-write order.
+  final Map<String, _PendingWrite> _writeSet = <String, _PendingWrite>{};
 
-    if (value != null) {
-      _readSet[key] = MVCCVersion(
-        value: value,
-        transactionId: id,
-        timestamp: DateTime.now(),
-      );
-    }
+  /// Committed values observed by reads (null = key absent), used for
+  /// repeatable reads and commit-time validation. Pessimistic levels only.
+  final Map<String, Uint8List?> _readSet = <String, Uint8List?>{};
 
-    return value;
-  }
+  /// Optimistic mode: version of each key at first read/write access.
+  final Map<String, int> _accessVersions = <String, int>{};
 
-  // Puts value
-  Future<void> put(String key, Uint8List value) async {
-    if (_state != TransactionState.active) {
-      throw StateError('Transaction is not active');
-    }
-
-    final lockAcquired = await _lockManager.acquireLock(
-      key,
-      id,
-      LockType.exclusive,
-    );
-    if (!lockAcquired) {
-      throw Exception('Failed to acquire write lock for key: $key');
-    }
-
-    final operation = TransactionOperation(
-      type: 'put',
-      key: key,
-      value: value,
-      timestamp: DateTime.now(),
-    );
-
-    _writeSet[key] = operation;
-    _operationLog.add(operation);
-  }
-
-  // Deletes key
-  Future<void> delete(String key) async {
-    if (_state != TransactionState.active) {
-      throw StateError('Transaction is not active');
-    }
-
-    final lockAcquired = await _lockManager.acquireLock(
-      key,
-      id,
-      LockType.exclusive,
-    );
-    if (!lockAcquired) {
-      throw Exception('Failed to acquire write lock for key: $key');
-    }
-
-    final operation = TransactionOperation(
-      type: 'delete',
-      key: key,
-      value: null,
-      timestamp: DateTime.now(),
-    );
-
-    _writeSet[key] = operation;
-    _operationLog.add(operation);
-  }
-
-  // Commits transaction
-  Future<void> commit() async {
-    if (_state != TransactionState.active) {
-      throw StateError('Transaction is not active');
-    }
-
-    _state = TransactionState.preparing;
-
-    try {
-      if (isolationLevel == IsolationLevel.repeatableRead ||
-          isolationLevel == IsolationLevel.serializable) {
-        await _validateReadSet();
-      }
-
-      for (final operation in _writeSet.values) {
-        final keyBytes = operation.key.codeUnits;
-
-        if (operation.type == 'put') {
-          await _storageEngine.put(keyBytes, operation.value!);
-        } else if (operation.type == 'delete') {
-          await _storageEngine.delete(keyBytes);
-        }
-      }
-
-      _state = TransactionState.committed;
-    } catch (e) {
-      _state = TransactionState.aborted;
-      rethrow;
-    } finally {
-      _lockManager.releaseLocks(id);
-    }
-  }
-
-  // Aborts transaction
-  Future<void> abort() async {
-    _state = TransactionState.aborted;
-    _lockManager.releaseLocks(id);
-  }
-
-  // Gets state
+  /// Current lifecycle state.
   TransactionState get state => _state;
 
-  // Gets write set size
+  /// Number of keys this transaction has pending writes for.
   int get writeSetSize => _writeSet.length;
 
-  // Gets read set size
+  /// Number of keys recorded in the read set (pessimistic levels).
   int get readSetSize => _readSet.length;
 
-  // Gets operation count
-  int get operationCount => _operationLog.length;
+  void _ensureActive() {
+    if (_state != TransactionState.active) {
+      throw TransactionConflictException(
+        'Transaction $id is ${_state.name} and no longer accepts operations',
+        transactionId: id,
+      );
+    }
+  }
 
-  Future<void> _validateReadSet() async {
-    for (final entry in _readSet.entries) {
-      final key = entry.key;
-      final expectedVersion = entry.value;
+  /// Reads [key], observing this transaction's own pending writes first.
+  ///
+  /// Returns null when the key is absent (or deleted by this transaction).
+  Future<Uint8List?> get(String key) async {
+    _ensureActive();
 
-      final currentValue = await _storageEngine.get(key.codeUnits);
+    final _PendingWrite? pending = _writeSet[key];
+    if (pending != null) {
+      return pending.isDelete ? null : pending.value;
+    }
 
-      if (currentValue == null && expectedVersion.value.isNotEmpty) {
-        throw Exception('Read set validation failed: key $key was deleted');
+    switch (isolationLevel) {
+      case IsolationLevel.readCommitted:
+        // Lock-free: storage only ever contains committed data.
+        return _manager._readCommitted(key);
+      case IsolationLevel.repeatableRead:
+      case IsolationLevel.serializable:
+        if (_readSet.containsKey(key)) return _readSet[key];
+        await _acquire(key, LockType.shared);
+        final Uint8List? value = await _manager._readCommitted(key);
+        _readSet[key] = value;
+        return value;
+      case IsolationLevel.optimistic:
+        final Uint8List? value = await _manager._readCommitted(key);
+        _accessVersions.putIfAbsent(key, () => _manager._versionOf(key));
+        return value;
+    }
+  }
+
+  /// Buffers a write of [key] = [value], applied atomically at commit.
+  Future<void> put(String key, Uint8List value) async {
+    _ensureActive();
+    await _lockForWrite(key);
+    _writeSet[key] = _PendingWrite.put(value);
+  }
+
+  /// Buffers a deletion of [key], applied atomically at commit.
+  Future<void> delete(String key) async {
+    _ensureActive();
+    await _lockForWrite(key);
+    _writeSet[key] = _PendingWrite.delete();
+  }
+
+  Future<void> _lockForWrite(String key) async {
+    if (isolationLevel == IsolationLevel.optimistic) {
+      _accessVersions.putIfAbsent(key, () => _manager._versionOf(key));
+      return;
+    }
+    await _acquire(key, LockType.exclusive);
+  }
+
+  /// Acquires a lock, aborting this transaction on deadlock/timeout so its
+  /// locks are released on every error path.
+  Future<void> _acquire(String key, LockType mode) async {
+    try {
+      await _manager._lockManager.acquire(key, id, mode);
+    } on ReaxDbException {
+      await _manager.abort(this);
+      rethrow;
+    }
+  }
+}
+
+/// Creates, commits and aborts [Transaction]s over a [StorageEngine].
+///
+/// Commit applies the whole write set through a single
+/// [StorageEngine.writeBatch] call tagged with the transaction id; the
+/// engine's WAL makes the batch all-or-nothing across crashes. The manager
+/// never calls `put`/`delete` on the engine for transactional writes.
+final class TransactionManager {
+  /// Creates a manager over [storageEngine].
+  ///
+  /// [lockTimeout] bounds how long any single lock wait may block before
+  /// failing with [TransactionTimeoutException] (deadlocks are normally
+  /// detected immediately and do not wait for this backstop).
+  TransactionManager({
+    required StorageEngine storageEngine,
+    IsolationLevel defaultIsolationLevel = IsolationLevel.readCommitted,
+    Duration lockTimeout = const Duration(seconds: 10),
+  }) : _engine = storageEngine,
+       _defaultIsolationLevel = defaultIsolationLevel,
+       _lockManager = LockManager(defaultTimeout: lockTimeout);
+
+  final StorageEngine _engine;
+  final IsolationLevel _defaultIsolationLevel;
+  final LockManager _lockManager;
+  final _AsyncMutex _commitMutex = _AsyncMutex();
+
+  final Map<int, Transaction> _active = <int, Transaction>{};
+
+  /// Version stamp per key, bumped on every committed write. Used by
+  /// optimistic validation; cleared whenever no transaction is active so it
+  /// cannot grow without bound.
+  final Map<String, int> _keyVersions = <String, int>{};
+  int _versionCounter = 0;
+
+  int _nextTransactionId = 0;
+  int _committedCount = 0;
+  int _abortedCount = 0;
+  bool _closed = false;
+
+  /// The lock manager (exposed for tests and diagnostics).
+  LockManager get lockManager => _lockManager;
+
+  /// Counters describing this manager's activity.
+  TransactionStats get stats => TransactionStats(
+    activeTransactions: _active.length,
+    committedTransactions: _committedCount,
+    abortedTransactions: _abortedCount,
+  );
+
+  /// Transactions currently active or preparing.
+  List<Transaction> get activeTransactions => _active.values.toList();
+
+  /// Starts a new transaction.
+  Transaction begin({IsolationLevel? isolationLevel}) {
+    if (_closed) {
+      throw const DatabaseClosedException('TransactionManager is closed');
+    }
+    final Transaction tx = Transaction._(
+      id: ++_nextTransactionId,
+      isolationLevel: isolationLevel ?? _defaultIsolationLevel,
+      manager: this,
+    );
+    _active[tx.id] = tx;
+    return tx;
+  }
+
+  /// Commits [tx], applying its whole write set atomically.
+  ///
+  /// Returns a [CommitResult] listing every applied operation with the
+  /// committed value that preceded it, so the caller (the database facade)
+  /// can invalidate caches, maintain secondary indexes and emit change
+  /// events. Throws [TransactionConflictException] when validation fails
+  /// (serializable read-set validation or optimistic version validation);
+  /// on any failure the transaction is aborted and its locks are released.
+  Future<CommitResult> commit(Transaction tx) async {
+    if (tx._state != TransactionState.active) {
+      throw TransactionConflictException(
+        'Cannot commit transaction ${tx.id}: it is ${tx._state.name}',
+        transactionId: tx.id,
+      );
+    }
+    tx._state = TransactionState.preparing;
+    try {
+      final CommitResult result = await _commitMutex.run(() async {
+        switch (tx.isolationLevel) {
+          case IsolationLevel.readCommitted:
+            break;
+          case IsolationLevel.repeatableRead:
+          case IsolationLevel.serializable:
+            await _validateReadSet(tx);
+          case IsolationLevel.optimistic:
+            _validateVersions(tx);
+        }
+
+        final List<AppliedOperation> applied = <AppliedOperation>[];
+        final List<WriteOp> ops = <WriteOp>[];
+        for (final MapEntry<String, _PendingWrite> entry
+            in tx._writeSet.entries) {
+          final Uint8List keyBytes = _keyBytes(entry.key);
+          final Uint8List? oldValue = await _engine.get(keyBytes);
+          if (entry.value.isDelete) {
+            ops.add(WriteOp.delete(keyBytes));
+            applied.add(
+              AppliedOperation(
+                type: AppliedOperationType.delete,
+                key: entry.key,
+                oldValue: oldValue,
+                newValue: null,
+              ),
+            );
+          } else {
+            final Uint8List value = entry.value.value!;
+            ops.add(WriteOp.put(keyBytes, value));
+            applied.add(
+              AppliedOperation(
+                type: AppliedOperationType.put,
+                key: entry.key,
+                oldValue: oldValue,
+                newValue: value,
+              ),
+            );
+          }
+        }
+
+        if (ops.isNotEmpty) {
+          await _engine.writeBatch(ops, transactionId: tx.id);
+          for (final String key in tx._writeSet.keys) {
+            _keyVersions[key] = ++_versionCounter;
+          }
+        }
+
+        tx._state = TransactionState.committed;
+        _committedCount++;
+        return CommitResult(transactionId: tx.id, operations: applied);
+      });
+      return result;
+    } catch (_) {
+      tx._state = TransactionState.aborted;
+      _abortedCount++;
+      rethrow;
+    } finally {
+      _lockManager.releaseAll(tx.id);
+      _active.remove(tx.id);
+      _maybeResetVersions();
+    }
+  }
+
+  /// Aborts [tx], discarding its write set and releasing its locks.
+  ///
+  /// Idempotent: aborting an already-finished transaction is a no-op.
+  Future<void> abort(Transaction tx) async {
+    if (tx._state == TransactionState.committed ||
+        tx._state == TransactionState.aborted) {
+      // Still release defensively in case abort raced a failed operation.
+      _lockManager.releaseAll(tx.id);
+      _active.remove(tx.id);
+      return;
+    }
+    tx._state = TransactionState.aborted;
+    _abortedCount++;
+    _lockManager.releaseAll(tx.id);
+    _active.remove(tx.id);
+    _maybeResetVersions();
+  }
+
+  /// Runs [body] in a transaction, committing on success and aborting on
+  /// any error.
+  ///
+  /// Retries only on [TransactionConflictException] and
+  /// [DeadlockException], up to [maxAttempts] total attempts, sleeping
+  /// `initialBackoff * 2^(attempt-1)` between attempts (exponential
+  /// backoff, no jitter). Any other exception aborts and rethrows
+  /// immediately. [onCommit] receives the [CommitResult] of the successful
+  /// attempt, before this method returns.
+  Future<T> runTransaction<T>(
+    Future<T> Function(Transaction tx) body, {
+    IsolationLevel? isolationLevel,
+    int maxAttempts = 3,
+    Duration initialBackoff = const Duration(milliseconds: 5),
+    void Function(CommitResult result)? onCommit,
+  }) async {
+    if (maxAttempts < 1) {
+      throw TransactionConflictException(
+        'maxAttempts must be at least 1 (got $maxAttempts)',
+      );
+    }
+    int attempt = 0;
+    while (true) {
+      attempt++;
+      final Transaction tx = begin(isolationLevel: isolationLevel);
+      try {
+        final T value = await body(tx);
+        final CommitResult result = await commit(tx);
+        onCommit?.call(result);
+        return value;
+      } on ReaxDbException catch (error) {
+        await abort(tx);
+        final bool retryable =
+            error is TransactionConflictException || error is DeadlockException;
+        if (!retryable || attempt >= maxAttempts) rethrow;
+        await Future<void>.delayed(initialBackoff * (1 << (attempt - 1)));
+      } catch (_) {
+        await abort(tx);
+        rethrow;
       }
+    }
+  }
 
-      if (currentValue != null &&
-          !_bytesEqual(currentValue, expectedVersion.value)) {
-        throw Exception('Read set validation failed: key $key was modified');
+  /// Aborts every active transaction and rejects new ones.
+  Future<void> close() async {
+    _closed = true;
+    for (final Transaction tx in _active.values.toList()) {
+      await abort(tx);
+    }
+  }
+
+  // -- internals ----------------------------------------------------------
+
+  Uint8List _keyBytes(String key) => Uint8List.fromList(utf8.encode(key));
+
+  Future<Uint8List?> _readCommitted(String key) => _engine.get(_keyBytes(key));
+
+  int _versionOf(String key) => _keyVersions[key] ?? 0;
+
+  void _maybeResetVersions() {
+    if (_active.isEmpty) {
+      _keyVersions.clear();
+    }
+  }
+
+  /// Re-reads every key in the read set and fails if any committed value
+  /// differs from what the transaction observed, including keys that were
+  /// read as absent (phantom inserts of a read key).
+  Future<void> _validateReadSet(Transaction tx) async {
+    for (final MapEntry<String, Uint8List?> entry in tx._readSet.entries) {
+      final Uint8List? current = await _readCommitted(entry.key);
+      final Uint8List? observed = entry.value;
+      final bool same =
+          (current == null && observed == null) ||
+          (current != null &&
+              observed != null &&
+              _bytesEqual(current, observed));
+      if (!same) {
+        throw TransactionConflictException(
+          'Read-set validation failed for transaction ${tx.id}: '
+          'key "${entry.key}" changed after it was read',
+          transactionId: tx.id,
+        );
+      }
+    }
+  }
+
+  /// Optimistic validation: every key this transaction read or wrote must
+  /// still be at the version it had when first accessed.
+  void _validateVersions(Transaction tx) {
+    for (final MapEntry<String, int> entry in tx._accessVersions.entries) {
+      if (_versionOf(entry.key) != entry.value) {
+        throw TransactionConflictException(
+          'Optimistic validation failed for transaction ${tx.id}: '
+          'key "${entry.key}" was modified concurrently',
+          transactionId: tx.id,
+        );
       }
     }
   }
@@ -354,128 +438,5 @@ class Transaction {
       if (a[i] != b[i]) return false;
     }
     return true;
-  }
-}
-
-// Transaction manager
-class TransactionManager {
-  final HybridStorageEngine _storageEngine;
-  final LockManager _lockManager = LockManager();
-  final Map<String, Transaction> _activeTransactions = {};
-  final IsolationLevel _defaultIsolationLevel;
-
-  int _transactionCounter = 0;
-  int _committedCount = 0;
-  int _abortedCount = 0;
-
-  TransactionManager({
-    required HybridStorageEngine storageEngine,
-    IsolationLevel defaultIsolationLevel = IsolationLevel.readCommitted,
-  }) : _storageEngine = storageEngine,
-       _defaultIsolationLevel = defaultIsolationLevel;
-
-  // Begins transaction
-  Transaction beginTransaction({IsolationLevel? isolationLevel}) {
-    final id =
-        'tx_${++_transactionCounter}_${DateTime.now().millisecondsSinceEpoch}';
-
-    final transaction = Transaction(
-      id: id,
-      isolationLevel: isolationLevel ?? _defaultIsolationLevel,
-      storageEngine: _storageEngine,
-      lockManager: _lockManager,
-    );
-
-    _activeTransactions[id] = transaction;
-    return transaction;
-  }
-
-  // Commits transaction
-  Future<void> commitTransaction(Transaction transaction) async {
-    try {
-      await transaction.commit();
-      _activeTransactions.remove(transaction.id);
-      _committedCount++;
-    } catch (e) {
-      await abortTransaction(transaction);
-      rethrow;
-    }
-  }
-
-  // Aborts transaction
-  Future<void> abortTransaction(Transaction transaction) async {
-    await transaction.abort();
-    _activeTransactions.remove(transaction.id);
-    _abortedCount++;
-  }
-
-  // Gets transaction by ID
-  Transaction? getTransaction(String id) {
-    return _activeTransactions[id];
-  }
-
-  // Gets active transactions
-  List<Transaction> getActiveTransactions() {
-    return _activeTransactions.values.toList();
-  }
-
-  // Gets statistics
-  TransactionStats getStats() {
-    final avgTransactionTime =
-        _activeTransactions.values.isNotEmpty
-            ? _activeTransactions.values
-                    .map(
-                      (tx) =>
-                          DateTime.now()
-                              .difference(tx.startTime)
-                              .inMilliseconds,
-                    )
-                    .reduce((a, b) => a + b) /
-                _activeTransactions.length
-            : 0.0;
-
-    return TransactionStats(
-      activeTransactions: _activeTransactions.length,
-      committedTransactions: _committedCount,
-      abortedTransactions: _abortedCount,
-      averageTransactionTime: avgTransactionTime,
-    );
-  }
-
-  // Executes in transaction
-  Future<T> executeTransaction<T>(
-    Future<T> Function(Transaction) operation, {
-    IsolationLevel? isolationLevel,
-    int maxRetries = 3,
-  }) async {
-    int retries = 0;
-
-    while (retries <= maxRetries) {
-      final transaction = beginTransaction(isolationLevel: isolationLevel);
-
-      try {
-        final result = await operation(transaction);
-        await commitTransaction(transaction);
-        return result;
-      } catch (e) {
-        await abortTransaction(transaction);
-
-        if (retries == maxRetries) {
-          rethrow;
-        }
-
-        retries++;
-        await Future.delayed(Duration(milliseconds: 100 * (1 << retries)));
-      }
-    }
-
-    throw Exception('Transaction failed after $maxRetries retries');
-  }
-
-  // Closes manager
-  Future<void> close() async {
-    for (final transaction in _activeTransactions.values.toList()) {
-      await abortTransaction(transaction);
-    }
   }
 }

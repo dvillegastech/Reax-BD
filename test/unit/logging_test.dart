@@ -1,276 +1,248 @@
-import 'package:test/test.dart';
-import 'package:reaxdb_dart/reaxdb_dart.dart';
+import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:reaxdb_dart/src/core/encryption/encryption_config.dart';
+import 'package:reaxdb_dart/src/core/encryption/encryption_engine.dart';
+import 'package:reaxdb_dart/src/core/logging/file_log_output.dart';
+import 'package:reaxdb_dart/src/core/logging/log_level.dart';
+import 'package:reaxdb_dart/src/core/logging/log_output.dart';
+import 'package:reaxdb_dart/src/core/logging/logger.dart';
+import 'package:reaxdb_dart/src/core/logging/redaction.dart';
+import 'package:test/test.dart';
 
 void main() {
-  group('Logging System Tests', () {
-    late MemoryLogOutput memoryOutput;
+  group('per-instance configuration', () {
+    test('two loggers have independent levels and outputs', () async {
+      final MemoryLogOutput outA = MemoryLogOutput();
+      final MemoryLogOutput outB = MemoryLogOutput();
+      final ReaxLogger a = ReaxLogger(
+        level: LogLevel.debug,
+        outputs: <LogOutput>[outA],
+        name: 'dbA',
+      );
+      final ReaxLogger b = ReaxLogger(
+        level: LogLevel.error,
+        outputs: <LogOutput>[outB],
+        name: 'dbB',
+      );
 
-    setUp(() {
-      memoryOutput = MemoryLogOutput();
-      logger.clearOutputs();
-      logger.addOutput(memoryOutput);
-      logger.setEnabled(true);
+      await a.debug('debug message');
+      await b.debug('debug message');
+      await b.error('error message');
+
+      expect(outA.logs, hasLength(1));
+      expect(outA.logs.single.message, contains('[dbA]'));
+      expect(outB.logs, hasLength(1));
+      expect(outB.logs.single.level, LogLevel.error);
+      expect(outB.logs.single.message, contains('[dbB]'));
     });
 
-    tearDown(() {
-      memoryOutput.clear();
-      logger.clearOutputs();
+    test('level threshold is honored', () async {
+      final MemoryLogOutput out = MemoryLogOutput();
+      final ReaxLogger log = ReaxLogger(
+        level: LogLevel.warning,
+        outputs: <LogOutput>[out],
+      );
+      await log.debug('nope');
+      await log.info('nope');
+      await log.warning('yes');
+      await log.error('yes');
+      expect(out.logs.map((LogEntry e) => e.level), <LogLevel>[
+        LogLevel.warning,
+        LogLevel.error,
+      ]);
     });
 
-    group('Log Levels', () {
-      test('should respect log level settings', () async {
-        logger.setLevel(LogLevel.warning);
+    test('configure replaces level, outputs and enabled at runtime', () async {
+      final MemoryLogOutput first = MemoryLogOutput();
+      final MemoryLogOutput second = MemoryLogOutput();
+      final ReaxLogger log = ReaxLogger(
+        level: LogLevel.info,
+        outputs: <LogOutput>[first],
+      );
+      await log.info('to first');
+      log.configure(level: LogLevel.debug, outputs: <LogOutput>[second]);
+      await log.debug('to second');
+      expect(first.logs, hasLength(1));
+      expect(second.logs, hasLength(1));
 
-        await logger.debug('Debug message');
-        await logger.info('Info message');
-        await logger.warning('Warning message');
-        await logger.error('Error message');
-
-        expect(memoryOutput.logs.length, equals(2));
-        expect(memoryOutput.logs[0].level, equals(LogLevel.warning));
-        expect(memoryOutput.logs[1].level, equals(LogLevel.error));
-      });
-
-      test('should log all levels when set to debug', () async {
-        logger.setLevel(LogLevel.debug);
-
-        await logger.debug('Debug');
-        await logger.info('Info');
-        await logger.warning('Warning');
-        await logger.error('Error');
-
-        expect(memoryOutput.logs.length, equals(4));
-      });
-
-      test('should log nothing when set to none', () async {
-        logger.setLevel(LogLevel.none);
-
-        await logger.debug('Debug');
-        await logger.info('Info');
-        await logger.warning('Warning');
-        await logger.error('Error');
-
-        expect(memoryOutput.logs.length, equals(0));
-      });
-
-      test('should handle enable/disable correctly', () async {
-        logger.setLevel(LogLevel.debug);
-        
-        await logger.info('Message 1');
-        logger.setEnabled(false);
-        await logger.info('Message 2');
-        logger.setEnabled(true);
-        await logger.info('Message 3');
-
-        expect(memoryOutput.logs.length, equals(2));
-        expect(memoryOutput.logs[0].message, equals('Message 1'));
-        expect(memoryOutput.logs[1].message, equals('Message 3'));
-      });
+      log.configure(enabled: false);
+      await log.error('dropped');
+      expect(second.logs, hasLength(1));
     });
 
-    group('Log Metadata', () {
-      test('should include metadata in logs', () async {
-        logger.setLevel(LogLevel.debug);
-
-        await logger.info('User action', metadata: {
-          'userId': 123,
-          'action': 'login',
-          'timestamp': '2025-01-01',
-        });
-
-        expect(memoryOutput.logs.length, equals(1));
-        expect(memoryOutput.logs[0].metadata, isNotNull);
-        expect(memoryOutput.logs[0].metadata!['userId'], equals(123));
-        expect(memoryOutput.logs[0].metadata!['action'], equals('login'));
-      });
-
-      test('should include error and stacktrace in metadata', () async {
-        logger.setLevel(LogLevel.error);
-
-        final error = Exception('Test exception');
-        final stackTrace = StackTrace.current;
-
-        await logger.error('Operation failed', 
-          error: error, 
-          stackTrace: stackTrace
-        );
-
-        expect(memoryOutput.logs.length, equals(1));
-        expect(memoryOutput.logs[0].metadata, isNotNull);
-        expect(memoryOutput.logs[0].metadata!['error'], contains('Test exception'));
-        expect(memoryOutput.logs[0].metadata!['stackTrace'], isNotNull);
-      });
-    });
-
-    group('Multiple Outputs', () {
-      test('should write to multiple outputs', () async {
-        final secondMemoryOutput = MemoryLogOutput();
-        logger.addOutput(secondMemoryOutput);
-        logger.setLevel(LogLevel.info);
-
-        await logger.info('Test message');
-
-        expect(memoryOutput.logs.length, equals(1));
-        expect(secondMemoryOutput.logs.length, equals(1));
-        expect(memoryOutput.logs[0].message, equals('Test message'));
-        expect(secondMemoryOutput.logs[0].message, equals('Test message'));
-      });
-
-      test('should handle output removal', () async {
-        final secondMemoryOutput = MemoryLogOutput();
-        logger.addOutput(secondMemoryOutput);
-        logger.setLevel(LogLevel.info);
-
-        await logger.info('Message 1');
-        logger.removeOutput(memoryOutput);
-        await logger.info('Message 2');
-
-        expect(memoryOutput.logs.length, equals(1));
-        expect(secondMemoryOutput.logs.length, equals(2));
-      });
-    });
-
-    group('File Output', () {
-      late String tempFilePath;
-      late FileLogOutput fileOutput;
-
-      setUp(() {
-        tempFilePath = 'test/temp_log_${DateTime.now().millisecondsSinceEpoch}.log';
-        fileOutput = FileLogOutput(tempFilePath);
-        logger.addOutput(fileOutput);
-      });
-
-      tearDown(() async {
-        await fileOutput.close();
-        final file = File(tempFilePath);
-        if (await file.exists()) {
-          await file.delete();
-        }
-      });
-
-      test('should write logs to file', () async {
-        logger.setLevel(LogLevel.info);
-
-        await logger.info('File log test');
-        await logger.error('Error in file');
-        
-        await fileOutput.close();
-
-        final file = File(tempFilePath);
-        expect(await file.exists(), isTrue);
-        
-        final contents = await file.readAsString();
-        expect(contents, contains('INFO: File log test'));
-        expect(contents, contains('ERROR: Error in file'));
-      });
-
-      test('should append to existing file', () async {
-        logger.setLevel(LogLevel.info);
-
-        await logger.info('First message');
-        await fileOutput.close();
-
-        // Create new output for same file
-        final newFileOutput = FileLogOutput(tempFilePath);
-        logger.clearOutputs();
-        logger.addOutput(newFileOutput);
-
-        await logger.info('Second message');
-        await newFileOutput.close();
-
-        final file = File(tempFilePath);
-        final contents = await file.readAsString();
-        expect(contents, contains('First message'));
-        expect(contents, contains('Second message'));
-      });
-    });
-
-    group('Console Output', () {
-      test('should create console output with colors', () {
-        final consoleOutput = ConsoleLogOutput(useColors: true);
-        expect(consoleOutput.useColors, isTrue);
-      });
-
-      test('should create console output without colors', () {
-        final consoleOutput = ConsoleLogOutput(useColors: false);
-        expect(consoleOutput.useColors, isFalse);
-      });
-    });
-
-    group('Configuration', () {
-      test('should configure logger with all options', () async {
-        final customOutput = MemoryLogOutput();
-        
-        logger.configure(
-          level: LogLevel.error,
-          outputs: [customOutput],
-          enabled: true,
-        );
-
-        await logger.debug('Debug');
-        await logger.info('Info');
-        await logger.warning('Warning');
-        await logger.error('Error');
-
-        expect(customOutput.logs.length, equals(1));
-        expect(customOutput.logs[0].level, equals(LogLevel.error));
-      });
-    });
-
-    group('Log Level Helpers', () {
-      test('should correctly determine if level should log', () {
-        expect(LogLevel.error.shouldLog(LogLevel.error), isTrue);
-        expect(LogLevel.error.shouldLog(LogLevel.warning), isFalse);
-        expect(LogLevel.error.shouldLog(LogLevel.info), isFalse);
-        expect(LogLevel.error.shouldLog(LogLevel.debug), isFalse);
-
-        expect(LogLevel.warning.shouldLog(LogLevel.error), isTrue);
-        expect(LogLevel.warning.shouldLog(LogLevel.warning), isTrue);
-        expect(LogLevel.warning.shouldLog(LogLevel.info), isFalse);
-        expect(LogLevel.warning.shouldLog(LogLevel.debug), isFalse);
-
-        expect(LogLevel.info.shouldLog(LogLevel.error), isTrue);
-        expect(LogLevel.info.shouldLog(LogLevel.warning), isTrue);
-        expect(LogLevel.info.shouldLog(LogLevel.info), isTrue);
-        expect(LogLevel.info.shouldLog(LogLevel.debug), isFalse);
-
-        expect(LogLevel.debug.shouldLog(LogLevel.error), isTrue);
-        expect(LogLevel.debug.shouldLog(LogLevel.warning), isTrue);
-        expect(LogLevel.debug.shouldLog(LogLevel.info), isTrue);
-        expect(LogLevel.debug.shouldLog(LogLevel.debug), isTrue);
-      });
-    });
-
-    group('Integration with ReaxDB', () {
-      test('should log database operations', () async {
-        logger.setLevel(LogLevel.debug);
-        
-        final testPath = 'test/logging_integration_db';
-        
-        // Clean up before test
-        final dir = Directory(testPath);
-        if (await dir.exists()) {
-          await dir.delete(recursive: true);
-        }
-
-        final db = await ReaxDB.open(testPath);
-        
-        // Perform operations that should trigger logging
-        await db.put('test_key', 'test_value');
-        await db.get('test_key');
-        
-        await db.close();
-        
-        // Clean up after test
-        if (await dir.exists()) {
-          await dir.delete(recursive: true);
-        }
-
-        // Check that logs were created (at least for warnings/errors if any)
-        // The exact number depends on internal implementation
-        expect(memoryOutput.logs, isNotEmpty);
-      });
+    test('metadata and error details are forwarded', () async {
+      final MemoryLogOutput out = MemoryLogOutput();
+      final ReaxLogger log = ReaxLogger(
+        level: LogLevel.error,
+        outputs: <LogOutput>[out],
+      );
+      await log.error(
+        'boom',
+        error: StateError('inner'),
+        metadata: <String, dynamic>{'code': 7},
+      );
+      final LogEntry entry = out.logs.single;
+      expect(entry.metadata!['code'], 7);
+      expect(entry.metadata!['error'], contains('inner'));
     });
   });
+
+  group('lifecycle', () {
+    test('close closes outputs and drops later writes', () async {
+      final _ClosableOutput out = _ClosableOutput();
+      final ReaxLogger log = ReaxLogger(
+        level: LogLevel.debug,
+        outputs: <LogOutput>[out],
+      );
+      await log.info('before close');
+      await log.close();
+      expect(out.closed, isTrue);
+      await log.info('after close');
+      expect(out.logs, hasLength(1));
+      // close is idempotent.
+      await log.close();
+    });
+
+    test('FileLogOutput writes, flushes and closes its sink', () async {
+      final Directory dir = await Directory.systemTemp.createTemp('reax_log');
+      addTearDown(() => dir.delete(recursive: true));
+      final String path = '${dir.path}/db.log';
+      final FileLogOutput fileOut = FileLogOutput(path);
+      final ReaxLogger log = ReaxLogger(
+        level: LogLevel.debug,
+        outputs: <LogOutput>[fileOut],
+      );
+      await log.info('persisted line');
+      await log.close();
+
+      final String content = await File(path).readAsString();
+      expect(content, contains('persisted line'));
+      // Writing after close is a no-op, not an error.
+      await fileOut.write(LogLevel.info, 'ignored');
+      expect(await File(path).readAsString(), isNot(contains('ignored')));
+    });
+
+    test('a throwing output does not break logging to other outputs', () async {
+      final MemoryLogOutput good = MemoryLogOutput();
+      final ReaxLogger log = ReaxLogger(
+        level: LogLevel.debug,
+        outputs: <LogOutput>[_ThrowingOutput(), good],
+      );
+      await log.info('survives');
+      expect(good.logs, hasLength(1));
+    });
+  });
+
+  group('redaction', () {
+    test('Redaction.key hides the key but stays correlatable', () {
+      const String pii = 'user:davidvillegas15@gmail.com';
+      final String redacted = Redaction.key(pii);
+      expect(redacted, isNot(contains('gmail')));
+      expect(redacted, isNot(contains('davidvillegas')));
+      expect(redacted, startsWith('key#'));
+      expect(redacted, contains('len=${pii.length}'));
+      // Deterministic for correlation, distinct for different keys.
+      expect(Redaction.key(pii), redacted);
+      expect(Redaction.key('other-key'), isNot(redacted));
+    });
+
+    test('Redaction.keyBytes matches key for the same UTF-8 bytes', () {
+      const String key = 'user:42';
+      expect(
+        Redaction.keyBytes(Uint8List.fromList(utf8.encode(key))),
+        Redaction.key(key),
+      );
+    });
+
+    test('Redaction.value reveals only type and size', () {
+      expect(Redaction.value(null), '<null>');
+      expect(Redaction.value('secret data'), isNot(contains('secret')));
+      expect(Redaction.value('secret data'), contains('11 chars'));
+      expect(
+        Redaction.value(<String, dynamic>{'ssn': '123'}),
+        isNot(contains('123')),
+      );
+      expect(Redaction.value(<int>[1, 2, 3]), contains('3 bytes'));
+    });
+  });
+
+  group('no key material in logs', () {
+    test('encryption operations never log key or passphrase bytes', () async {
+      final MemoryLogOutput out = MemoryLogOutput();
+      ReaxLogger.root.configure(
+        level: LogLevel.debug,
+        outputs: <LogOutput>[out],
+      );
+      addTearDown(() {
+        ReaxLogger.root.configure(level: LogLevel.info, outputs: <LogOutput>[]);
+      });
+
+      const String passphrase = 'ultra-secret-passphrase-XYZZY';
+      final Uint8List key = Uint8List.fromList(
+        List<int>.generate(32, (int i) => 0xA5),
+      );
+      final Uint8List salt = Uint8List.fromList(
+        List<int>.generate(16, (int i) => i),
+      );
+
+      final EncryptionEngine e1 = EncryptionEngine(
+        EncryptionConfig.aes256(key: key),
+      );
+      final EncryptionEngine e2 = EncryptionEngine(
+        EncryptionConfig.aes256FromPassphrase(
+          passphrase: passphrase,
+          iterations: 1000,
+        ),
+        kdfSalt: salt,
+      );
+      final Uint8List data = Uint8List.fromList(utf8.encode('hello'));
+      e1.decrypt(e1.encrypt(data));
+      e2.decrypt(e2.encrypt(data));
+      e1.getMetadata();
+
+      final String allLogs = out.logs
+          .map((LogEntry e) => '${e.message} ${e.metadata ?? ''}')
+          .join('\n');
+      expect(allLogs, isNot(contains('XYZZY')));
+      expect(allLogs, isNot(contains(passphrase)));
+      // Hex or decimal renderings of the constant-byte key would contain
+      // repeated a5/165 runs; the simplest guarantee is that nothing about
+      // these operations was logged at all.
+      expect(out.logs, isEmpty);
+    });
+
+    test('getMetadata contains no key material fields', () {
+      final EncryptionEngine engine = EncryptionEngine(
+        EncryptionConfig.aes256(
+          key: Uint8List.fromList(List<int>.generate(32, (int i) => i)),
+        ),
+      );
+      final String rendered = engine.getMetadata().toString().toLowerCase();
+      expect(rendered, isNot(contains('key')));
+      expect(rendered, isNot(contains('passphrase')));
+      expect(rendered, isNot(contains('salt')));
+    });
+  });
+}
+
+class _ClosableOutput extends MemoryLogOutput {
+  bool closed = false;
+
+  @override
+  Future<void> close() async {
+    closed = true;
+  }
+}
+
+class _ThrowingOutput extends LogOutput {
+  @override
+  Future<void> write(
+    LogLevel level,
+    String message, {
+    Map<String, dynamic>? metadata,
+  }) async {
+    throw StateError('output failure');
+  }
 }

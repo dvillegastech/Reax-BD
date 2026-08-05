@@ -1,452 +1,272 @@
-import 'package:test/test.dart';
-import 'package:reaxdb_dart/src/core/storage/hybrid_storage_engine.dart';
-import 'package:reaxdb_dart/src/core/storage/lsm_tree.dart';
-import 'package:reaxdb_dart/src/core/storage/memtable.dart';
-import 'package:reaxdb_dart/src/domain/entities/database_entity.dart';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:reaxdb_dart/src/core/errors/exceptions.dart';
+import 'package:reaxdb_dart/src/core/storage/lsm_storage_engine.dart';
+import 'package:reaxdb_dart/src/core/storage/storage_engine.dart';
+import 'package:reaxdb_dart/src/core/wal/write_ahead_log.dart';
+import 'package:test/test.dart';
+
+Uint8List _b(String s) => Uint8List.fromList(utf8.encode(s));
+
 void main() {
-  group('Storage Engine Tests', () {
-    late HybridStorageEngine storageEngine;
-    final testPath = 'test/storage_engine_test_db';
+  late Directory dir;
 
-    setUp(() async {
-      // Clean up any existing test database
-      final dir = Directory(testPath);
-      if (await dir.exists()) {
-        await dir.delete(recursive: true);
-      }
+  setUp(() async {
+    dir = await Directory.systemTemp.createTemp('engine_test_');
+  });
 
-      // Create storage engine
-      storageEngine = await HybridStorageEngine.create(
-        path: testPath,
-        config: StorageConfig(
-          memtableSize: 512 * 1024, // 512KB for faster testing
-          pageSize: 4096,
-          compressionEnabled: false,
-          syncWrites: true,
-          maxImmutableMemtables: 2,
-        ),
+  tearDown(() async {
+    if (await dir.exists()) await dir.delete(recursive: true);
+  });
+
+  Future<LsmStorageEngine> openEngine({
+    int memtableSizeBytes = 4 * 1024 * 1024,
+  }) => LsmStorageEngine.open(
+    directory: dir.path,
+    syncMode: SyncMode.os,
+    memtableSizeBytes: memtableSizeBytes,
+  );
+
+  group('LsmStorageEngine basics', () {
+    test('put/get/delete round-trip', () async {
+      final engine = await openEngine();
+      await engine.put(_b('k'), _b('v'));
+      expect(await engine.get(_b('k')), _b('v'));
+      await engine.delete(_b('k'));
+      expect(await engine.get(_b('k')), isNull);
+      await engine.close();
+    });
+
+    test('empty values are data, not tombstones', () async {
+      final engine = await openEngine();
+      await engine.put(_b('empty'), Uint8List(0));
+      expect(await engine.get(_b('empty')), isEmpty);
+      await engine.flush();
+      expect(await engine.get(_b('empty')), isEmpty);
+      await engine.close();
+
+      final reopened = await openEngine();
+      expect(await reopened.get(_b('empty')), isEmpty);
+      await reopened.close();
+    });
+
+    test('deleted keys stay deleted across flush, compact, reopen', () async {
+      final engine = await openEngine();
+      await engine.put(_b('victim'), _b('data'));
+      await engine.flush();
+      await engine.delete(_b('victim'));
+      await engine.flush();
+      expect(await engine.get(_b('victim')), isNull);
+      await engine.compact();
+      expect(await engine.get(_b('victim')), isNull);
+      await engine.close();
+
+      final reopened = await openEngine();
+      expect(
+        await reopened.get(_b('victim')),
+        isNull,
+        reason: 'deleted key must not resurrect after reopen',
       );
+      await reopened.close();
     });
 
-    tearDown(() async {
-      await storageEngine.close();
+    test('newest value wins after multiple flushes and compaction', () async {
+      final engine = await openEngine();
+      await engine.put(_b('k'), _b('v1'));
+      await engine.flush();
+      await engine.put(_b('k'), _b('v2'));
+      await engine.flush();
+      await engine.put(_b('k'), _b('v3'));
+      expect(await engine.get(_b('k')), _b('v3'));
+      await engine.compact();
+      expect(await engine.get(_b('k')), _b('v3'));
+      await engine.close();
+    });
 
-      // Clean up test database
-      final dir = Directory(testPath);
-      if (await dir.exists()) {
-        await dir.delete(recursive: true);
+    test('writeBatch is applied together', () async {
+      final engine = await openEngine();
+      await engine.put(_b('old'), _b('x'));
+      await engine.writeBatch([
+        WriteOp.put(_b('a'), _b('1')),
+        WriteOp.put(_b('b'), _b('2')),
+        WriteOp.delete(_b('old')),
+      ]);
+      expect(await engine.get(_b('a')), _b('1'));
+      expect(await engine.get(_b('b')), _b('2'));
+      expect(await engine.get(_b('old')), isNull);
+      await engine.close();
+    });
+
+    test('data survives clean close and reopen via WAL replay', () async {
+      final engine = await openEngine();
+      await engine.put(_b('persist'), _b('me'));
+      await engine.close();
+      final reopened = await openEngine();
+      expect(await reopened.get(_b('persist')), _b('me'));
+      await reopened.close();
+    });
+
+    test('memtable overflow flushes to disk automatically', () async {
+      final engine = await openEngine(memtableSizeBytes: 8 * 1024);
+      for (var i = 0; i < 200; i++) {
+        await engine.put(_b('key-$i'), Uint8List(100));
       }
+      expect(engine.stats.sstableCount, greaterThan(0));
+      for (var i = 0; i < 200; i += 37) {
+        expect(await engine.get(_b('key-$i')), Uint8List(100));
+      }
+      await engine.close();
     });
 
-    test('should store and retrieve data', () async {
-      // Put data
-      await storageEngine.put(
-        'test_key'.codeUnits,
-        Uint8List.fromList('test_value'.codeUnits),
+    test('operations after close throw DatabaseClosedException', () async {
+      final engine = await openEngine();
+      await engine.close();
+      expect(
+        () => engine.put(_b('k'), _b('v')),
+        throwsA(isA<DatabaseClosedException>()),
       );
-
-      // Get data
-      final value = await storageEngine.get('test_key'.codeUnits);
-      expect(value, isNotNull);
-      expect(String.fromCharCodes(value!), equals('test_value'));
-    });
-
-    test('should handle memtable rotation', () async {
-      // Fill memtable to trigger rotation
-      final largeValue = Uint8List(10 * 1024); // 10KB
-      for (int i = 0; i < largeValue.length; i++) {
-        largeValue[i] = i % 256;
-      }
-
-      // Write enough to trigger rotation
-      for (int i = 0; i < 60; i++) {
-        await storageEngine.put('rotation_key_$i'.codeUnits, largeValue);
-      }
-
-      // Should still be able to read all values
-      for (int i = 0; i < 60; i++) {
-        final value = await storageEngine.get('rotation_key_$i'.codeUnits);
-        expect(value, isNotNull);
-        expect(value!.length, equals(largeValue.length));
-      }
-    });
-
-    test('should delete keys', () async {
-      // Put data
-      await storageEngine.put(
-        'delete_key'.codeUnits,
-        Uint8List.fromList('delete_value'.codeUnits),
+      expect(
+        () => engine.get(_b('k')),
+        throwsA(isA<DatabaseClosedException>()),
       );
-
-      // Verify it exists
-      var value = await storageEngine.get('delete_key'.codeUnits);
-      expect(value, isNotNull);
-
-      // Delete
-      await storageEngine.delete('delete_key'.codeUnits);
-
-      // Verify it's gone
-      value = await storageEngine.get('delete_key'.codeUnits);
-      expect(value, isNull);
+      // Double close is safe.
+      await engine.close();
     });
 
-    test('should handle batch operations', () async {
-      // Use smaller batch to avoid conflicts
-      final entries = <List<int>, Uint8List>{};
-      for (int i = 0; i < 20; i++) {
-        entries['batch_key_$i'.codeUnits] = Uint8List.fromList(
-          'batch_value_$i'.codeUnits,
-        );
-      }
-
-      await storageEngine.putBatch(entries);
-
-      // Wait a bit for batch to complete
-      await Future.delayed(Duration(milliseconds: 100));
-
-      // Verify individually
-      for (int i = 0; i < 20; i++) {
-        final value = await storageEngine.get('batch_key_$i'.codeUnits);
-        expect(value, isNotNull);
-        expect(String.fromCharCodes(value!), equals('batch_value_$i'));
-      }
-    });
-
-    test('should handle compaction', () async {
-      // Write data to multiple levels
-      for (int i = 0; i < 200; i++) {
-        await storageEngine.put(
-          'compact_key_$i'.codeUnits,
-          Uint8List.fromList('compact_value_$i'.codeUnits),
-        );
-      }
-
-      // Force compaction
-      await storageEngine.compact();
-
-      // All data should still be accessible
-      for (int i = 0; i < 200; i++) {
-        final value = await storageEngine.get('compact_key_$i'.codeUnits);
-        expect(value, isNotNull);
-        expect(String.fromCharCodes(value!), equals('compact_value_$i'));
-      }
-    });
-
-    test('should track database size', () async {
-      // Get initial size
-      final initialSize = await storageEngine.getDatabaseSize();
-      expect(initialSize, greaterThanOrEqualTo(0));
-
-      // Add data
-      final largeData = Uint8List(100 * 1024); // 100KB
-      for (int i = 0; i < 10; i++) {
-        await storageEngine.put('size_key_$i'.codeUnits, largeData);
-      }
-
-      // Force flush by calling compact
-      await storageEngine.compact();
-
-      // Size should increase
-      final newSize = await storageEngine.getDatabaseSize();
-      expect(newSize, greaterThan(initialSize));
-    });
-
-    test('should track entry count', () async {
-      // Get initial count
-      final initialCount = await storageEngine.getEntryCount();
-      expect(initialCount, equals(0));
-
-      // Add entries
-      for (int i = 0; i < 50; i++) {
-        await storageEngine.put(
-          'count_key_$i'.codeUnits,
-          Uint8List.fromList('count_value_$i'.codeUnits),
-        );
-      }
-
-      // Count should match
-      final newCount = await storageEngine.getEntryCount();
-      expect(newCount, equals(50));
-
-      // Delete some
-      for (int i = 0; i < 10; i++) {
-        await storageEngine.delete('count_key_$i'.codeUnits);
-      }
-
-      // Count might not decrease immediately due to tombstones
-      final afterDeleteCount = await storageEngine.getEntryCount();
-      expect(afterDeleteCount, greaterThanOrEqualTo(40));
-    });
-
-    test(
-      'should handle concurrent operations with connection pooling',
-      () async {
-        // Do operations sequentially to avoid StreamSink conflicts
-        // Write some data first
-        for (int i = 0; i < 10; i++) {
-          await storageEngine.put(
-            'concurrent_$i'.codeUnits,
-            Uint8List.fromList('value_$i'.codeUnits),
-          );
-        }
-
-        // Mix of reads and updates
-        for (int i = 0; i < 10; i++) {
-          if (i % 2 == 0) {
-            // Read
-            final value = await storageEngine.get('concurrent_$i'.codeUnits);
-            expect(value, isNotNull);
-          } else {
-            // Update
-            await storageEngine.put(
-              'concurrent_$i'.codeUnits,
-              Uint8List.fromList('updated_$i'.codeUnits),
-            );
-          }
-        }
-
-        // Verify some values
-        final value = await storageEngine.get('concurrent_1'.codeUnits);
-        expect(value, isNotNull);
-        expect(String.fromCharCodes(value!), equals('updated_1'));
-      },
-    );
-
-    test('should persist data across restarts', () async {
-      // Skip this test - persistence requires proper WAL recovery
-      return;
-
-      // Write data
-    });
-
-    test('should handle updates correctly', () async {
-      // Initial value
-      await storageEngine.put(
-        'update_key'.codeUnits,
-        Uint8List.fromList('initial_value'.codeUnits),
-      );
-
-      // Update multiple times
-      for (int i = 0; i < 10; i++) {
-        await storageEngine.put(
-          'update_key'.codeUnits,
-          Uint8List.fromList('updated_value_$i'.codeUnits),
-        );
-      }
-
-      // Should have latest value
-      final value = await storageEngine.get('update_key'.codeUnits);
-      expect(value, isNotNull);
-      expect(String.fromCharCodes(value!), equals('updated_value_9'));
-    });
-
-    test('should handle mixed workload', () async {
-      // Simulate real-world mixed operations
-      for (int i = 0; i < 100; i++) {
-        final key = 'mixed_${i % 20}'.codeUnits;
-
-        if (i % 5 == 0) {
-          // Write
-          await storageEngine.put(
-            key,
-            Uint8List.fromList('value_$i'.codeUnits),
-          );
-        } else if (i % 5 == 1) {
-          // Read
-          await storageEngine.get(key);
-        } else if (i % 5 == 2) {
-          // Update
-          await storageEngine.put(
-            key,
-            Uint8List.fromList('updated_$i'.codeUnits),
-          );
-        } else if (i % 5 == 3) {
-          // Delete
-          await storageEngine.delete(key);
-        } else {
-          // Read again
-          await storageEngine.get(key);
-        }
-      }
-
-      // Should complete without errors
-      expect(true, isTrue);
-    });
-
-    test('should handle large values', () async {
-      // Create large values of different sizes
-      final sizes = [
-        1024, // 1KB
-        10 * 1024, // 10KB
-        100 * 1024, // 100KB
-        1024 * 1024, // 1MB
+    test('100 concurrent puts and gets settle consistently', () async {
+      final engine = await openEngine();
+      final puts = [
+        for (var i = 0; i < 100; i++) engine.put(_b('c-$i'), _b('value-$i')),
       ];
-
-      for (int i = 0; i < sizes.length; i++) {
-        final largeValue = Uint8List(sizes[i]);
-        for (int j = 0; j < largeValue.length; j++) {
-          largeValue[j] = (j + i) % 256;
-        }
-
-        // Write
-        await storageEngine.put('large_$i'.codeUnits, largeValue);
-
-        // Read back
-        final value = await storageEngine.get('large_$i'.codeUnits);
-        expect(value, isNotNull);
-        expect(value!.length, equals(sizes[i]));
-
-        // Verify content
-        for (int j = 0; j < 100; j++) {
-          expect(value[j], equals(largeValue[j]));
-        }
+      await Future.wait(puts);
+      final gets = await Future.wait([
+        for (var i = 0; i < 100; i++) engine.get(_b('c-$i')),
+      ]);
+      for (var i = 0; i < 100; i++) {
+        expect(gets[i], _b('value-$i'));
       }
-    });
-
-    test('should handle empty values', () async {
-      // Put empty value
-      await storageEngine.put('empty_key'.codeUnits, Uint8List(0));
-
-      // Should be able to retrieve
-      final value = await storageEngine.get('empty_key'.codeUnits);
-      expect(value, isNotNull);
-      expect(value!.length, equals(0));
-    });
-
-    test('should handle special characters in keys', () async {
-      final specialKeys = [
-        'key with spaces',
-        'key:with:colons',
-        'key/with/slashes',
-        'key\\with\\backslashes',
-        'key.with.dots',
-        'key_with_underscores',
-        'key-with-dashes',
-        'key@with@special#chars',
-        'unicode_key_🔑',
-        'key\nwith\nnewlines',
-        'key\twith\ttabs',
-      ];
-
-      for (final key in specialKeys) {
-        await storageEngine.put(
-          key.codeUnits,
-          Uint8List.fromList('special_value'.codeUnits),
-        );
-
-        final value = await storageEngine.get(key.codeUnits);
-        expect(value, isNotNull);
-        expect(String.fromCharCodes(value!), equals('special_value'));
-      }
-    });
-
-    test('should handle batch operations with failures', () async {
-      // Use individual puts to avoid batch conflicts
-      for (int i = 0; i < 20; i++) {
-        await storageEngine.put(
-          'batch_fail_$i'.codeUnits,
-          Uint8List.fromList('value_$i'.codeUnits),
-        );
-      }
-
-      // Very large key
-      final longKey = 'x' * 1000;
-      await storageEngine.put(
-        longKey.codeUnits,
-        Uint8List.fromList('long_key_value'.codeUnits),
-      );
-
-      // Verify entries were written
-      for (int i = 0; i < 20; i++) {
-        final value = await storageEngine.get('batch_fail_$i'.codeUnits);
-        expect(value, isNotNull);
-      }
-
-      // Large key should also work
-      final largeKeyValue = await storageEngine.get(longKey.codeUnits);
-      expect(largeKeyValue, isNotNull);
+      await engine.close();
     });
   });
 
-  group('LSM Tree Tests', () {
-    late LsmTree lsmTree;
-    final testPath = 'test/lsm_test_db';
-
-    setUp(() async {
-      final dir = Directory(testPath);
-      if (await dir.exists()) {
-        await dir.delete(recursive: true);
-      }
-
-      lsmTree = await LsmTree.create(basePath: testPath);
+  group('LsmStorageEngine scan', () {
+    test('scans in key order across memtable and sstables', () async {
+      final engine = await openEngine();
+      await engine.put(_b('d'), _b('4'));
+      await engine.put(_b('b'), _b('2'));
+      await engine.flush();
+      await engine.put(_b('a'), _b('1'));
+      await engine.put(_b('c'), _b('3'));
+      final keys =
+          await engine.scan().map((kv) => utf8.decode(kv.key)).toList();
+      expect(keys, ['a', 'b', 'c', 'd']);
+      await engine.close();
     });
 
-    tearDown(() async {
-      await lsmTree.close();
-
-      final dir = Directory(testPath);
-      if (await dir.exists()) {
-        await dir.delete(recursive: true);
-      }
+    test('newest version wins in scan', () async {
+      final engine = await openEngine();
+      await engine.put(_b('k'), _b('old'));
+      await engine.flush();
+      await engine.put(_b('k'), _b('new'));
+      final values =
+          await engine.scan().map((kv) => utf8.decode(kv.value)).toList();
+      expect(values, ['new']);
+      await engine.close();
     });
 
-    test('should handle SSTable creation and loading', () async {
-      // Create memtable with data
-      final memtable = MemTable(maxSize: 1024 * 1024);
-      for (int i = 0; i < 100; i++) {
-        memtable.put(
-          'lsm_key_$i'.codeUnits,
-          Uint8List.fromList('lsm_value_$i'.codeUnits),
+    test('tombstones hide flushed values in scan', () async {
+      final engine = await openEngine();
+      await engine.put(_b('a'), _b('1'));
+      await engine.put(_b('b'), _b('2'));
+      await engine.flush();
+      await engine.delete(_b('a'));
+      final keys =
+          await engine.scan().map((kv) => utf8.decode(kv.key)).toList();
+      expect(keys, ['b']);
+      await engine.close();
+    });
+
+    test('range bounds are inclusive start, exclusive end', () async {
+      final engine = await openEngine();
+      for (final k in ['a', 'b', 'c', 'd', 'e']) {
+        await engine.put(_b(k), _b('v$k'));
+      }
+      await engine.flush();
+      final keys =
+          await engine
+              .scan(startKey: _b('b'), endKey: _b('e'))
+              .map((kv) => utf8.decode(kv.key))
+              .toList();
+      expect(keys, ['b', 'c', 'd']);
+      await engine.close();
+    });
+
+    test('reverse scan yields descending keys with same bounds', () async {
+      final engine = await openEngine();
+      for (final k in ['a', 'b', 'c', 'd', 'e']) {
+        await engine.put(_b(k), _b('v$k'));
+      }
+      await engine.flush();
+      await engine.put(_b('bb'), _b('mem'));
+      final keys =
+          await engine
+              .scan(startKey: _b('b'), endKey: _b('e'), reverse: true)
+              .map((kv) => utf8.decode(kv.key))
+              .toList();
+      expect(keys, ['d', 'c', 'bb', 'b']);
+      await engine.close();
+    });
+
+    test('limit caps results in both directions', () async {
+      final engine = await openEngine();
+      for (final k in ['a', 'b', 'c', 'd']) {
+        await engine.put(_b(k), _b('v$k'));
+      }
+      final forward =
+          await engine.scan(limit: 2).map((kv) => utf8.decode(kv.key)).toList();
+      expect(forward, ['a', 'b']);
+      final backward =
+          await engine
+              .scan(limit: 2, reverse: true)
+              .map((kv) => utf8.decode(kv.key))
+              .toList();
+      expect(backward, ['d', 'c']);
+      await engine.close();
+    });
+
+    test('scan merges across multiple levels after compaction', () async {
+      final engine = await openEngine(memtableSizeBytes: 2 * 1024);
+      for (var i = 0; i < 100; i++) {
+        await engine.put(
+          _b('key-${i.toString().padLeft(3, '0')}'),
+          Uint8List(64),
         );
       }
-
-      // Flush to SSTable
-      await lsmTree.flush(memtable);
-
-      // Should be able to read back
-      for (int i = 0; i < 100; i++) {
-        final value = await lsmTree.get('lsm_key_$i'.codeUnits);
-        expect(value, isNotNull);
-        expect(String.fromCharCodes(value!), equals('lsm_value_$i'));
-      }
-    });
-
-    test('should handle level compaction', () async {
-      // Write enough data to trigger compaction
-      for (int batch = 0; batch < 10; batch++) {
-        final memtable = MemTable(maxSize: 1024 * 1024);
-
-        for (int i = 0; i < 100; i++) {
-          final key = 'compact_${batch}_$i';
-          memtable.put(
-            key.codeUnits,
-            Uint8List.fromList('value_${batch}_$i'.codeUnits),
-          );
-        }
-
-        await lsmTree.flush(memtable);
-      }
-
-      // Force compaction
-      await lsmTree.compact();
-
-      // All data should still be accessible
-      for (int batch = 0; batch < 10; batch++) {
-        for (int i = 0; i < 100; i++) {
-          final key = 'compact_${batch}_$i';
-          final value = await lsmTree.get(key.codeUnits);
-          expect(value, isNotNull);
-        }
-      }
+      await engine.compact();
+      await engine.put(_b('key-050'), _b('updated'));
+      final results = await engine.scan().toList();
+      expect(results.length, 100);
+      final updated = results.firstWhere(
+        (kv) => utf8.decode(kv.key) == 'key-050',
+      );
+      expect(utf8.decode(updated.value), 'updated');
+      await engine.close();
     });
   });
 
-  // B+ Tree tests commented out - implementation needs fixes
-  // group('B+ Tree Tests', () {
-  //   // B+ Tree implementation is incomplete
-  //   // These tests would fail due to missing persistence functionality
-  // });
+  group('LsmStorageEngine stats', () {
+    test('reports memtable and sstable counters', () async {
+      final engine = await openEngine();
+      await engine.put(_b('k'), _b('v'));
+      expect(engine.stats.memtableEntries, 1);
+      expect(engine.stats.lastSequenceNumber, greaterThan(0));
+      await engine.flush();
+      expect(engine.stats.memtableEntries, 0);
+      expect(engine.stats.sstableCount, 1);
+      expect(engine.stats.sstableSizeBytes, greaterThan(0));
+      await engine.close();
+    });
+  });
 }

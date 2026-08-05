@@ -1,384 +1,299 @@
+import 'package:reaxdb_dart/src/core/indexing/index_manager.dart';
+import 'package:reaxdb_dart/src/core/query/aggregation.dart';
+import 'package:reaxdb_dart/src/core/query/query_builder.dart';
 import 'package:test/test.dart';
-import 'package:reaxdb_dart/reaxdb_dart.dart';
-import 'dart:io';
+
+import '../support/query_test_harness.dart';
 
 void main() {
-  group('Enhanced Query Builder Tests', () {
-    late ReaxDB db;
-    final testPath = 'test/enhanced_query_test_db';
+  late IndexManager indexManager;
+  late PipelineDocumentStore store;
 
-    setUp(() async {
-      // Clean up before test
-      final dir = Directory(testPath);
-      if (await dir.exists()) {
-        await dir.delete(recursive: true);
-      }
-      db = await ReaxDB.open(testPath);
+  setUp(() {
+    final harness = buildHarness();
+    indexManager = harness.indexManager;
+    store = harness.store;
+  });
 
-      // Seed test data
-      await _seedTestData(db);
+  QueryBuilder query(String collection) => QueryBuilder(
+    collection: collection,
+    store: store,
+    indexManager: indexManager,
+  );
+
+  group('collection scanning', () {
+    test('finds documents with string ids and ids above 1000', () async {
+      // The old scan probed only 'collection:1'..'collection:1000'.
+      await store.putDocument('users', 'uuid-abc', {'name': 'ana'});
+      await store.putDocument('users', '5000', {'name': 'bob'});
+      await store.putDocument('users', '7', {'name': 'eve'});
+
+      final results = await query('users').find();
+      expect(results, hasLength(3));
+
+      expect(await query('users').count(), equals(3));
+      expect(
+        await query('users').whereEquals('name', 'ana').find(),
+        hasLength(1),
+      );
     });
 
-    tearDown(() async {
-      await db.close();
-      // Clean up after test
-      final dir = Directory(testPath);
-      if (await dir.exists()) {
-        await dir.delete(recursive: true);
-      }
+    test('update and delete reach documents regardless of id shape', () async {
+      await store.putDocument('users', 'uuid-abc', {'age': 1});
+      await store.putDocument('users', '9999', {'age': 1});
+
+      final int updated = await query('users').update({'age': 2});
+      expect(updated, equals(2));
+      expect((await store.getDocument('users', 'uuid-abc'))!['age'], equals(2));
+
+      final int deleted = await query('users').delete();
+      expect(deleted, equals(2));
+      expect(await query('users').count(), equals(0));
     });
 
-    group('Aggregation Functions', () {
-      test('should count documents', () async {
-        final result = await db
-            .collection('products')
-            .aggregate((agg) => agg.count())
-            .executeAggregation();
+    test('update on a document without an id field updates in place', () async {
+      // The old update() rebuilt the key from doc['id'] ?? doc['_id'] and
+      // otherwise generated a timestamp key, creating a NEW document.
+      await store.putDocument('users', 'k1', {'name': 'ana', 'age': 30});
 
-        expect(result, isA<Map<String, AggregationResult>>());
-        expect(result['count'].value, equals(10));
-      });
+      final int updated = await query(
+        'users',
+      ).whereEquals('name', 'ana').update({'age': 31});
+      expect(updated, equals(1));
 
-      test('should calculate sum', () async {
-        final result = await db
-            .collection('products')
-            .aggregate((agg) => agg.sum('price'))
-            .executeAggregation();
-
-        expect(result['sum_price'].value, equals(4900));
-      });
-
-      test('should calculate average', () async {
-        final result = await db
-            .collection('products')
-            .aggregate((agg) => agg.avg('price'))
-            .executeAggregation();
-
-        expect(result['avg_price'].value, equals(490));
-      });
-
-      test('should find min and max values', () async {
-        final result = await db
-            .collection('products')
-            .aggregate((agg) => agg
-              .min('price')
-              .max('price'))
-            .executeAggregation();
-
-        expect(result['min_price'].value, equals(100));
-        expect(result['max_price'].value, equals(1000));
-      });
-
-      test('should count distinct values', () async {
-        final result = await db
-            .collection('products')
-            .aggregate((agg) => agg.distinct('category'))
-            .executeAggregation();
-
-        expect(result['distinct_category'].value, equals(3));
-        expect(result['distinct_category'].metadata['values'], 
-          containsAll(['electronics', 'books', 'clothing']));
-      });
-
-      test('should support multiple aggregations', () async {
-        final result = await db
-            .collection('products')
-            .aggregate((agg) => agg
-              .count()
-              .sum('price')
-              .avg('price')
-              .min('stock')
-              .max('stock'))
-            .executeAggregation();
-
-        expect(result['count'].value, equals(10));
-        expect(result['sum_price'].value, equals(4900));
-        expect(result['avg_price'].value, equals(490));
-        expect(result['min_stock'].value, equals(5));
-        expect(result['max_stock'].value, equals(50));
-      });
-    });
-
-    group('Group By Operations', () {
-      test('should group by category', () async {
-        final result = await db
-            .collection('products')
-            .aggregate((agg) => agg
-              .groupBy('category')
-              .count()
-              .sum('price')
-              .avg('price'))
-            .executeAggregation();
-
-        expect(result, isA<List<GroupByResult>>());
-        expect(result.length, equals(3));
-
-        final electronics = result.firstWhere((g) => g.groupKey == 'electronics');
-        expect(electronics.documents.length, equals(4));
-        expect(electronics.aggregations['count'].value, equals(4));
-      });
-
-      test('should group and calculate aggregations per group', () async {
-        final result = await db
-            .collection('orders')
-            .aggregate((agg) => agg
-              .groupBy('customerId')
-              .count()
-              .sum('total')
-              .avg('total'))
-            .executeAggregation();
-
-        expect(result, isA<List<GroupByResult>>());
-        
-        final customer1 = result.firstWhere((g) => g.groupKey == 'customer1');
-        expect(customer1.aggregations['count'].value, equals(2));
-        expect(customer1.aggregations['sum_total'].value, equals(350));
-        expect(customer1.aggregations['avg_total'].value, equals(175));
-      });
-    });
-
-    group('Text Search', () {
-      test('should search in all fields', () async {
-        final results = await db
-            .collection('products')
-            .search('laptop')
-            .find();
-
-        expect(results.length, equals(1));
-        expect(results[0]['name'], equals('Laptop'));
-      });
-
-      test('should search in specific field', () async {
-        final results = await db
-            .collection('products')
-            .search('novel', field: 'description')
-            .find();
-
-        expect(results.length, equals(2));
-        expect(results.every((r) => r['category'] == 'books'), isTrue);
-      });
-
-      test('should be case insensitive', () async {
-        final results = await db
-            .collection('products')
-            .search('PHONE')
-            .find();
-
-        // Phone and Headphones both contain 'phone'
-        expect(results.length, equals(2));
-        expect(results.any((r) => r['name'] == 'Phone'), isTrue);
-        expect(results.any((r) => r['name'] == 'Headphones'), isTrue);
-      });
-
-      test('should combine search with other conditions', () async {
-        final results = await db
-            .collection('products')
-            .whereGreaterThan('price', 200)
-            .search('book')
-            .find();
-
-        expect(results.length, equals(1));
-        expect(results[0]['name'], equals('Textbook'));
-      });
-    });
-
-    group('Distinct Values', () {
-      test('should get distinct categories', () async {
-        final categories = await db
-            .collection('products')
-            .distinct('category');
-
-        expect(categories.length, equals(3));
-        expect(categories, containsAll(['electronics', 'books', 'clothing']));
-      });
-
-      test('should get distinct values with filter', () async {
-        final prices = await db
-            .collection('products')
-            .whereEquals('category', 'electronics')
-            .distinct('price');
-
-        expect(prices.length, equals(4));
-        expect(prices, containsAll([800, 500, 1000, 700]));
-      });
-    });
-
-    group('Update Operations', () {
-      test('should update matching documents', () async {
-        final updateCount = await db
-            .collection('products')
-            .whereEquals('category', 'books')
-            .update({'onSale': true, 'discount': 0.2});
-
-        expect(updateCount, equals(3));
-
-        // Verify updates
-        final books = await db
-            .collection('products')
-            .whereEquals('category', 'books')
-            .find();
-
-        expect(books.every((b) => b['onSale'] == true), isTrue);
-        expect(books.every((b) => b['discount'] == 0.2), isTrue);
-      });
-
-      test('should update with complex conditions', () async {
-        final updateCount = await db
-            .collection('products')
-            .whereGreaterThan('price', 500)
-            .whereLessThan('stock', 20)
-            .update({'priority': 'high'});
-
-        expect(updateCount, greaterThan(0));
-      });
-    });
-
-    group('Delete Operations', () {
-      test('should delete matching documents', () async {
-        final deleteCount = await db
-            .collection('products')
-            .whereLessThan('stock', 10)
-            .delete();
-
-        expect(deleteCount, equals(2));
-
-        // Verify deletion
-        final remaining = await db
-            .collection('products')
-            .find();
-
-        expect(remaining.length, equals(8));
-      });
-
-      test('should delete with multiple conditions', () async {
-        final deleteCount = await db
-            .collection('products')
-            .whereEquals('category', 'electronics')
-            .whereGreaterThan('price', 600)
-            .delete();
-
-        expect(deleteCount, equals(3));
-      });
-    });
-
-    group('Complex Queries', () {
-      test('should handle contains operator for arrays', () async {
-        await db.put('products:11', {
-          'name': 'Multi-category',
-          'categories': ['electronics', 'accessories'],
-        });
-
-        final results = await db
-            .collection('products')
-            .where('categories', QueryOperator.contains, 'accessories')
-            .find();
-
-        expect(results.length, equals(1));
-        expect(results[0]['name'], equals('Multi-category'));
-      });
-
-      test('should chain multiple operations', () async {
-        final result = await db
-            .collection('products')
-            .whereGreaterThan('price', 200)
-            .whereLessThan('price', 900)
-            .orderBy('price', descending: true)
-            .limit(3)
-            .aggregate((agg) => agg
-              .count()
-              .avg('price'))
-            .executeAggregation();
-
-        expect(result['count'].value, equals(3));
-      });
-
-      test('should handle nested field queries', () async {
-        await db.put('products:12', {
-          'name': 'Complex Product',
-          'details': {
-            'manufacturer': 'ACME',
-            'warranty': 24,
-            'specs': {
-              'weight': 1.5,
-              'color': 'black'
-            }
-          }
-        });
-
-        // Note: This would require implementing nested field support
-        // For now, we'll test that the structure is preserved
-        final product = await db.get<Map<String, dynamic>>('products:12');
-        expect(product!['details']['manufacturer'], equals('ACME'));
-        expect(product['details']['specs']['color'], equals('black'));
-      });
-    });
-
-    group('Performance', () {
-      test('should handle large aggregations efficiently', () async {
-        // Add more test data
-        for (int i = 100; i < 1000; i++) {
-          await db.put('products:$i', {
-            'name': 'Product $i',
-            'price': (i % 100) * 10,
-            'category': ['cat1', 'cat2', 'cat3'][i % 3],
-            'stock': i % 50,
-          });
-        }
-
-        final stopwatch = Stopwatch()..start();
-        
-        final result = await db
-            .collection('products')
-            .aggregate((agg) => agg
-              .groupBy('category')
-              .count()
-              .sum('price')
-              .avg('price')
-              .min('price')
-              .max('price'))
-            .executeAggregation();
-
-        stopwatch.stop();
-
-        expect(result, isA<List<GroupByResult>>());
-        expect(result.length, equals(6)); // 3 original categories + 3 new ones
-        expect(stopwatch.elapsedMilliseconds, lessThan(1000)); // Should be fast
-      });
+      expect(
+        await query('users').count(),
+        equals(1),
+        reason: 'update must not create a duplicate document',
+      );
+      expect((await store.getDocument('users', 'k1'))!['age'], equals(31));
     });
   });
-}
 
-Future<void> _seedTestData(ReaxDB db) async {
-  // Products collection
-  final products = [
-    {'id': '1', 'name': 'Laptop', 'price': 800, 'category': 'electronics', 'stock': 15, 'description': 'High performance laptop'},
-    {'id': '2', 'name': 'Phone', 'price': 500, 'category': 'electronics', 'stock': 30, 'description': 'Smartphone with 5G'},
-    {'id': '3', 'name': 'Tablet', 'price': 1000, 'category': 'electronics', 'stock': 10, 'description': 'Professional tablet'},
-    {'id': '4', 'name': 'Headphones', 'price': 700, 'category': 'electronics', 'stock': 25, 'description': 'Wireless headphones'},
-    {'id': '5', 'name': 'Novel', 'price': 100, 'category': 'books', 'stock': 50, 'description': 'Bestselling novel'},
-    {'id': '6', 'name': 'Textbook', 'price': 450, 'category': 'books', 'stock': 5, 'description': 'Computer science textbook'},
-    {'id': '7', 'name': 'Comic', 'price': 150, 'category': 'books', 'stock': 40, 'description': 'Graphic novel series'},
-    {'id': '8', 'name': 'T-Shirt', 'price': 200, 'category': 'clothing', 'stock': 35, 'description': 'Cotton t-shirt'},
-    {'id': '9', 'name': 'Jeans', 'price': 400, 'category': 'clothing', 'stock': 20, 'description': 'Denim jeans'},
-    {'id': '10', 'name': 'Jacket', 'price': 600, 'category': 'clothing', 'stock': 8, 'description': 'Winter jacket'},
-  ];
+  group('builder behavior', () {
+    test('findOne does not mutate the builder', () async {
+      for (int i = 0; i < 5; i++) {
+        await store.putDocument('n', '$i', {'v': i});
+      }
+      final QueryBuilder q = query('n');
+      final first = await q.findOne();
+      expect(first, isNotNull);
+      expect(
+        await q.find(),
+        hasLength(5),
+        reason: 'findOne must not permanently apply limit(1)',
+      );
+    });
 
-  for (final product in products) {
-    await db.put('products:${product['id']}', product);
-  }
+    test('limit and offset window results deterministically', () async {
+      for (int i = 0; i < 10; i++) {
+        await store.putDocument('n', 'k$i', {'v': i});
+      }
+      final results = await query('n').orderBy('v').offset(3).limit(4).find();
+      expect(results.map((doc) => doc['v']).toList(), equals([3, 4, 5, 6]));
+    });
 
-  // Orders collection for join tests
-  final orders = [
-    {'id': '1', 'customerId': 'customer1', 'productId': '1', 'quantity': 1, 'total': 150},
-    {'id': '2', 'customerId': 'customer1', 'productId': '2', 'quantity': 2, 'total': 200},
-    {'id': '3', 'customerId': 'customer2', 'productId': '3', 'quantity': 1, 'total': 300},
-    {'id': '4', 'customerId': 'customer3', 'productId': '1', 'quantity': 3, 'total': 450},
-  ];
+    test(
+      'scan terminates early when limit is reached without orderBy',
+      () async {
+        for (int i = 0; i < 50; i++) {
+          await store.putDocument('n', 'k$i', {'v': i});
+        }
+        final results = await query('n').limit(2).find();
+        expect(results, hasLength(2));
+      },
+    );
+  });
 
-  for (final order in orders) {
-    await db.put('orders:${order['id']}', order);
-  }
+  group('type comparisons', () {
+    test('mixed int and double order numerically', () async {
+      await store.putDocument('m', 'a', {'v': 10});
+      await store.putDocument('m', 'b', {'v': 9.5});
+      await store.putDocument('m', 'c', {'v': -3});
 
-  // Indexes would be created separately through IndexManager in a real app
-  // For testing, we'll skip index creation as it's not part of QueryBuilder
+      final results = await query('m').orderBy('v').find();
+      expect(results.map((doc) => doc['v']).toList(), equals([-3, 9.5, 10]));
+    });
+
+    test('numbers and numeric strings never compare via toString', () async {
+      // Old behavior: "10" < "9" applied even to numbers vs strings.
+      await store.putDocument('m', 'a', {'v': 10});
+      await store.putDocument('m', 'b', {'v': '9'});
+
+      final results = await query('m').whereGreaterThan('v', 9).find();
+      // 10 > 9 numerically; the string "9" is a different type and sorts
+      // above all numbers, so it also matches the total order.
+      expect(results, hasLength(2));
+
+      final onlyNumbers = await query('m').whereBetween('v', 0, 1000).find();
+      expect(onlyNumbers.map((doc) => doc['v']).toList(), equals([10]));
+    });
+
+    test('booleans and nulls have defined positions', () async {
+      await store.putDocument('m', 'a', {'v': true});
+      await store.putDocument('m', 'b', {'v': false});
+      await store.putDocument('m', 'c', {'v': null});
+      await store.putDocument('m', 'd', {'v': 1});
+
+      final results = await query('m').orderBy('v').find();
+      expect(
+        results.map((doc) => doc['v']).toList(),
+        equals([null, false, true, 1]),
+      );
+    });
+
+    test('orderBy supports nullsLast', () async {
+      await store.putDocument('m', 'a', {'v': null});
+      await store.putDocument('m', 'b', {'v': 2});
+      await store.putDocument('m', 'c', {'v': 1});
+
+      final results = await query('m').orderBy('v', nullsLast: true).find();
+      expect(results.map((doc) => doc['v']).toList(), equals([1, 2, null]));
+
+      final descending =
+          await query(
+            'm',
+          ).orderBy('v', descending: true, nullsLast: true).find();
+      expect(descending.map((doc) => doc['v']).toList(), equals([2, 1, null]));
+    });
+
+    test('whereEquals(5) matches 5.0 on the scan path too', () async {
+      await store.putDocument('m', 'a', {'v': 5.0});
+      expect(await query('m').whereEquals('v', 5).find(), hasLength(1));
+    });
+
+    test('whereIn matches with numeric unification', () async {
+      await store.putDocument('m', 'a', {'v': 2.0});
+      await store.putDocument('m', 'b', {'v': 3});
+      expect(await query('m').whereIn('v', [2, 4]).find(), hasLength(1));
+    });
+  });
+
+  group('index integration', () {
+    test('indexed and scanned execution return identical results', () async {
+      for (int i = 0; i < 20; i++) {
+        await store.putDocument('u', 'k$i', {'age': i, 'even': i.isEven});
+      }
+      final unindexed =
+          await query('u').whereGreaterThan('age', 10).orderBy('age').find();
+
+      await indexManager.createIndex('u', 'age');
+      final indexed =
+          await query('u').whereGreaterThan('age', 10).orderBy('age').find();
+
+      expect(
+        indexed.map((doc) => doc['age']).toList(),
+        equals(unindexed.map((doc) => doc['age']).toList()),
+      );
+    });
+
+    test('an index on another field never hides documents', () async {
+      // The old planner treated any index's candidate set as authoritative
+      // and an empty index returned [] for everything.
+      await indexManager.createIndex('u', 'age');
+      await store.putDocument('u', '1', {'name': 'ana'});
+      expect(await query('u').whereEquals('name', 'ana').find(), hasLength(1));
+    });
+
+    test('nested field queries agree between index and scan', () async {
+      await store.putDocument('u', '1', {
+        'address': {'city': 'lima'},
+      });
+      final scanned =
+          await query('u').whereEquals('address.city', 'lima').find();
+      await indexManager.createIndex('u', 'address.city');
+      final indexed =
+          await query('u').whereEquals('address.city', 'lima').find();
+      expect(indexed, equals(scanned));
+      expect(indexed, hasLength(1));
+    });
+  });
+
+  group('aggregation', () {
+    setUp(() async {
+      await store.putDocument('s', '1', {'cat': 'a', 'v': 10});
+      await store.putDocument('s', '2', {'cat': 'a', 'v': 2.5});
+      await store.putDocument('s', '3', {'cat': 'b', 'v': 7});
+    });
+
+    test('sum, avg, min, max over mixed int/double', () async {
+      final results =
+          await query('s')
+                  .aggregate(
+                    (AggregationBuilder a) =>
+                        a.sum('v').avg('v').min('v').max('v').count(),
+                  )
+                  .executeAggregation()
+              as Map<String, AggregationResult>;
+
+      expect(results['sum_v']!.value, equals(19.5));
+      expect(results['avg_v']!.value, equals(6.5));
+      expect(results['min_v']!.value, equals(2.5));
+      expect(results['max_v']!.value, equals(10));
+      expect(results['count']!.value, equals(3));
+    });
+
+    test('min and max tolerate mixed types without throwing', () async {
+      // The old implementation cast to Comparable and threw on int vs
+      // double vs String mixes.
+      await store.putDocument('s', '4', {'v': 'zz'});
+      final results =
+          await query('s')
+                  .aggregate((AggregationBuilder a) => a.min('v').max('v'))
+                  .executeAggregation()
+              as Map<String, AggregationResult>;
+      expect(results['min_v']!.value, equals(2.5));
+      expect(results['max_v']!.value, equals('zz'));
+    });
+
+    test('groupBy aggregates per group', () async {
+      final results =
+          await query('s')
+                  .aggregate(
+                    (AggregationBuilder a) => a.groupBy('cat').sum('v'),
+                  )
+                  .executeAggregation()
+              as List<GroupByResult>;
+      expect(results, hasLength(2));
+      final GroupByResult groupA = results.firstWhere(
+        (GroupByResult g) => g.groupKey == 'a',
+      );
+      expect(groupA.aggregations['sum_v']!.value, equals(12.5));
+    });
+
+    test('distinct unifies 1 and 1.0', () async {
+      await store.putDocument('s', '5', {'v': 7.0});
+      final distinct = await query('s').distinct('v');
+      expect(distinct, hasLength(3)); // 10, 2.5, 7 (7.0 == 7)
+    });
+  });
+
+  group('joins and search', () {
+    test('join attaches matching foreign documents', () async {
+      await store.putDocument('orders', 'o1', {'userId': 'u1', 'total': 5});
+      await store.putDocument('orders', 'o2', {'userId': 'u2', 'total': 9});
+      await store.putDocument('users', 'a', {'id': 'u1', 'name': 'ana'});
+      await store.putDocument('users', 'b', {'id': 'u9', 'name': 'zoe'});
+
+      final results =
+          await query(
+            'orders',
+          ).join('users', 'userId', 'id').orderBy('total').find();
+
+      expect(results, hasLength(2));
+      final joined = results.first['_joined_users'] as List;
+      expect((joined.single as Map)['name'], equals('ana'));
+      expect(results.last.containsKey('_joined_users'), isFalse);
+    });
+
+    test('text search filters case-insensitively', () async {
+      await store.putDocument('docs', '1', {'body': 'Hello World'});
+      await store.putDocument('docs', '2', {'body': 'other'});
+      expect(await query('docs').search('world').find(), hasLength(1));
+      expect(
+        await query('docs').search('WORLD', field: 'body').find(),
+        hasLength(1),
+      );
+    });
+  });
 }

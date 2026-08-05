@@ -1,555 +1,218 @@
 import 'package:flutter/material.dart';
-import 'package:path_provider/path_provider.dart';
-import 'dart:async';
-import 'dart:math';
 
-import 'services/database_service.dart';
-import 'widgets/performance_stats_card.dart';
-import 'widgets/console_widget.dart';
-import 'widgets/action_button.dart';
+import 'screens/backup_demo_screen.dart';
+import 'screens/chat_demo_screen.dart';
+import 'screens/collection_demo_screen.dart';
+import 'screens/durability_demo_screen.dart';
+import 'screens/iteration_demo_screen.dart';
+import 'screens/overview_screen.dart';
 import 'screens/simple_demo_screen.dart';
 import 'screens/todo_demo_screen.dart';
-import 'screens/chat_demo_screen.dart';
+import 'screens/transactions_demo_screen.dart';
+import 'screens/ttl_demo_screen.dart';
 
 void main() {
-  runApp(ReaxDBExampleApp());
+  runApp(const ReaxDBExampleApp());
 }
 
+/// The example application: a catalogue of small, self-contained demos, one
+/// per ReaxDB feature.
 class ReaxDBExampleApp extends StatelessWidget {
+  /// Creates the example app.
   const ReaxDBExampleApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'ReaxDB Demo',
+      title: 'ReaxDB Example',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF2196F3),
-          brightness: Brightness.light,
-        ),
-        appBarTheme: const AppBarTheme(
-          centerTitle: true,
-          elevation: 0,
-          backgroundColor: Color(0xFF1976D2),
-          foregroundColor: Colors.white,
-        ),
-        elevatedButtonTheme: ElevatedButtonThemeData(
-          style: ElevatedButton.styleFrom(
-            elevation: 2,
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(8),
-            ),
-          ),
-        ),
+        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF1565C0)),
+        appBarTheme: const AppBarTheme(centerTitle: false),
         cardTheme: CardThemeData(
-          elevation: 4,
+          elevation: 0,
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(12),
+            side: const BorderSide(color: Color(0x1F000000)),
           ),
         ),
       ),
-      home: MainScreen(),
+      home: const HomeScreen(),
     );
   }
 }
 
-// Main Screen with Navigation
-class MainScreen extends StatefulWidget {
-  const MainScreen({super.key});
+/// One entry of the demo catalogue.
+@immutable
+class Demo {
+  /// Creates a catalogue entry.
+  const Demo({
+    required this.title,
+    required this.summary,
+    required this.api,
+    required this.icon,
+    required this.builder,
+  });
 
-  @override
-  State<MainScreen> createState() => _MainScreenState();
+  /// Name of the demo.
+  final String title;
+
+  /// One sentence describing what it shows.
+  final String summary;
+
+  /// The ReaxDB API the demo is about.
+  final String api;
+
+  /// Icon shown in the catalogue.
+  final IconData icon;
+
+  /// Builds the demo screen.
+  final WidgetBuilder builder;
 }
 
-class _MainScreenState extends State<MainScreen> {
-  int _selectedIndex = 0;
-  
-  final List<Widget> _screens = [
-    DatabaseExampleScreen(),  // Performance Demo (existing)
-    SimpleDemoScreen(),       // Simple CRUD Demo
-    TodoDemoScreen(),         // Todo App Demo
-    ChatDemoScreen(),         // Chat App Demo
-  ];
-  
+/// The demos this example ships with, in the order they are listed.
+final List<Demo> demos = <Demo>[
+  Demo(
+    title: 'Overview',
+    summary:
+        'Database information, live cache and storage statistics, '
+        'maintenance and a schema migration.',
+    api: 'ReaxDB.open, info(), statistics(), flush(), compact(), onUpgrade',
+    icon: Icons.dashboard_outlined,
+    builder: (_) => const OverviewScreen(),
+  ),
+  Demo(
+    title: 'Key/value basics',
+    summary: 'The small API: put, get, delete and pattern queries.',
+    api: 'ReaxDB.simple, SimpleReaxDB',
+    icon: Icons.widgets_outlined,
+    builder: (_) => const SimpleDemoScreen(),
+  ),
+  Demo(
+    title: 'Typed collections',
+    summary:
+        'Store a Dart class without code generation, index it and query it.',
+    api: 'db.collection<T>(), createIndex(), find(), watch()',
+    icon: Icons.category_outlined,
+    builder: (_) => const CollectionDemoScreen(),
+  ),
+  Demo(
+    title: 'Iteration and scans',
+    summary: 'Ordered iteration over the key space: prefixes, ranges, limits.',
+    api: 'scan(), scanPrefix(), keys(), range()',
+    icon: Icons.list_alt_outlined,
+    builder: (_) => const IterationDemoScreen(),
+  ),
+  Demo(
+    title: 'Expiring entries',
+    summary: 'Entries that expire on their own, and reclaiming their space.',
+    api: 'put(ttl:), ReaxEntry.expiresAt, purgeExpired()',
+    icon: Icons.timer_outlined,
+    builder: (_) => const TtlDemoScreen(),
+  ),
+  Demo(
+    title: 'Transactions',
+    summary: 'An atomic transfer, a rollback, and a compare-and-swap.',
+    api: 'transaction(), IsolationLevel, compareAndSwap()',
+    icon: Icons.swap_horiz_outlined,
+    builder: (_) => const TransactionsDemoScreen(),
+  ),
+  Demo(
+    title: 'Backup and restore',
+    summary:
+        'Export a snapshot, restore it into an encrypted database, and see '
+        'the checksum reject a damaged archive.',
+    api: 'exportTo(), ReaxDB.importFrom(), EncryptionConfig.aes256',
+    icon: Icons.backup_outlined,
+    builder: (_) => const BackupDemoScreen(),
+  ),
+  Demo(
+    title: 'Durability modes',
+    summary: 'What each SyncMode costs, measured on this device.',
+    api: 'SyncMode.none / os / full, put(sync:)',
+    icon: Icons.save_outlined,
+    builder: (_) => const DurabilityDemoScreen(),
+  ),
+  Demo(
+    title: 'Todo list',
+    summary: 'A small app built on prefix scans and change streams.',
+    api: 'scanPrefix(), watchPrefix()',
+    icon: Icons.checklist_outlined,
+    builder: (_) => const TodoDemoScreen(),
+  ),
+  Demo(
+    title: 'Chat',
+    summary: 'An append-only log rendered live from a change stream.',
+    api: 'watchPrefix(), scanPrefix(reverse:)',
+    icon: Icons.forum_outlined,
+    builder: (_) => const ChatDemoScreen(),
+  ),
+];
+
+/// The catalogue of demos.
+class HomeScreen extends StatelessWidget {
+  /// Creates the catalogue screen.
+  const HomeScreen({super.key});
 
   @override
   Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
     return Scaffold(
-      body: _screens[_selectedIndex],
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _selectedIndex,
-        onDestinationSelected: (index) {
-          setState(() {
-            _selectedIndex = index;
-          });
-        },
-        destinations: const [
-          NavigationDestination(
-            icon: Icon(Icons.speed),
-            label: 'Performance',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.widgets),
-            label: 'Simple',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.check_box),
-            label: 'Todo',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.chat),
-            label: 'Chat',
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class DatabaseExampleScreen extends StatefulWidget {
-  const DatabaseExampleScreen({super.key});
-
-  @override
-  DatabaseExampleScreenState createState() => DatabaseExampleScreenState();
-}
-
-class DatabaseExampleScreenState extends State<DatabaseExampleScreen> {
-  final List<String> _logs = [];
-  bool _isLoading = false;
-  bool _realTimeMode = false;
-  int _realTimeCounter = 0;
-  Timer? _realTimeTimer;
-
-  final TextEditingController _keyController = TextEditingController();
-  final TextEditingController _valueController = TextEditingController();
-
-  // Performance metrics
-  int _totalOperations = 0;
-  int _successfulOperations = 0;
-  final List<int> _latencies = [];
-
-  @override
-  void initState() {
-    super.initState();
-    _initializeDatabase();
-  }
-
-  Future<void> _initializeDatabase() async {
-    setState(() {
-      _isLoading = true;
-      _logs.clear();
-    });
-
-    try {
-      _addLog('Initializing ReaxDB...');
-
-      final directory = await getApplicationDocumentsDirectory();
-      final dbPath = '${directory.path}/reaxdb_example';
-
-      _addLog('Database path: $dbPath');
-
-      await DatabaseService.initialize(dbPath);
-
-      _addLog('Database opened successfully!');
-
-      await _testBasicOperations();
-    } catch (e) {
-      _addLog('Error initializing database: $e');
-    } finally {
-      setState(() {
-        _isLoading = false;
-      });
-    }
-  }
-
-  Future<void> _testBasicOperations() async {
-    try {
-      _addLog('\n--- Testing Basic Operations ---');
-
-      await DatabaseService.database!.put('test_key', {
-        'message': 'Hello ReaxDB!',
-        'timestamp': DateTime.now().toIso8601String(),
-      });
-      _addLog('✓ Put operation successful');
-
-      final value = await DatabaseService.database!.get('test_key');
-      _addLog('✓ Get operation successful: $value');
-
-      final info = await DatabaseService.database!.getDatabaseInfo();
-      _addLog('✓ Database info: $info');
-    } catch (e) {
-      _addLog('Error in basic operations: $e');
-    }
-  }
-
-  Future<void> _runSecurityTests() async {
-    try {
-      final logs = await DatabaseService.runSecurityTests();
-      for (final log in logs) {
-        _addLog(log);
-      }
-    } catch (e) {
-      _addLog('❌ Security test error: $e');
-    }
-  }
-
-  Future<void> _runConcurrencyTest() async {
-    try {
-      final logs = await DatabaseService.runConcurrencyTest();
-      for (final log in logs) {
-        _addLog(log);
-      }
-    } catch (e) {
-      _addLog('❌ Concurrency test error: $e');
-    }
-  }
-
-  Future<void> _runOptimizedConcurrencyTest() async {
-    try {
-      final logs = await DatabaseService.runOptimizedConcurrencyTest();
-      for (final log in logs) {
-        _addLog(log);
-      }
-    } catch (e) {
-      _addLog('❌ Optimized test error: $e');
-    }
-  }
-
-  Future<void> _runExtremeStressTest() async {
-    try {
-      final logs = await DatabaseService.runExtremeStressTest();
-      for (final log in logs) {
-        _addLog(log);
-      }
-    } catch (e) {
-      _addLog('❌ Extreme stress test error: $e');
-    }
-  }
-
-  Future<void> _startRealTimeTest() async {
-    if (_realTimeMode) {
-      _stopRealTimeTest();
-      return;
-    }
-
-    try {
-      _addLog('\n⚡ --- REAL-TIME PERFORMANCE TEST STARTED ---');
-
-      setState(() {
-        _realTimeMode = true;
-        _realTimeCounter = 0;
-        _latencies.clear();
-        _totalOperations = 0;
-        _successfulOperations = 0;
-      });
-
-      _realTimeTimer = Timer.periodic(Duration(milliseconds: 100), (
-        timer,
-      ) async {
-        if (!_realTimeMode) {
-          timer.cancel();
-          return;
-        }
-
-        final stopwatch = Stopwatch()..start();
-
-        try {
-          await DatabaseService.database!.put('realtime_$_realTimeCounter', {
-            'sensor_id': _realTimeCounter % 10,
-            'value': Random().nextDouble() * 100,
-            'timestamp': DateTime.now().millisecondsSinceEpoch,
-            'location': {
-              'lat': 40.7128 + Random().nextDouble(),
-              'lng': -74.0060 + Random().nextDouble(),
-            },
-          });
-
-          stopwatch.stop();
-          _latencies.add(stopwatch.elapsedMicroseconds);
-          _successfulOperations++;
-
-          if (_realTimeCounter % 50 == 0) {
-            final avgLatency =
-                _latencies.isEmpty
-                    ? 0
-                    : _latencies.reduce((a, b) => a + b) / _latencies.length;
-            final opsPerSec =
-                _successfulOperations / ((_realTimeCounter + 1) * 0.1);
-
-            _addLog(
-              '⚡ Real-time: ${_realTimeCounter + 1} ops, ${opsPerSec.toStringAsFixed(1)} ops/sec, ${avgLatency.toStringAsFixed(1)}μs avg',
-            );
-          }
-        } catch (e) {
-          _addLog('❌ Real-time error at operation $_realTimeCounter: $e');
-        }
-
-        _totalOperations++;
-        _realTimeCounter++;
-
-        if (_realTimeCounter >= 1000) {
-          _stopRealTimeTest();
-        }
-      });
-    } catch (e) {
-      _addLog('❌ Real-time test error: $e');
-    }
-  }
-
-  void _stopRealTimeTest() {
-    if (!_realTimeMode) return;
-
-    _realTimeTimer?.cancel();
-    setState(() {
-      _realTimeMode = false;
-    });
-
-    final avgLatency =
-        _latencies.isEmpty
-            ? 0
-            : _latencies.reduce((a, b) => a + b) / _latencies.length;
-    final totalTime = _totalOperations * 0.1;
-    final opsPerSec = _successfulOperations / totalTime;
-
-    _addLog('\n📊 REAL-TIME TEST RESULTS:');
-    _addLog('   Operations: $_successfulOperations/$_totalOperations');
-    _addLog(
-      '   Success rate: ${(_successfulOperations / _totalOperations * 100).toStringAsFixed(2)}%',
-    );
-    _addLog('   Throughput: ${opsPerSec.toStringAsFixed(2)} ops/sec');
-    _addLog('   Avg latency: ${avgLatency.toStringAsFixed(2)}μs');
-    _addLog(
-      '   Max latency: ${_latencies.isEmpty ? 0 : _latencies.reduce((a, b) => a > b ? a : b)}μs',
-    );
-  }
-
-  void _addLog(String message) {
-    if (mounted) {
-      setState(() {
-        _logs.add('[${DateTime.now().toString().substring(11, 19)}] $message');
-      });
-    }
-    debugPrint(message);
-  }
-
-  void _clearLogs() {
-    setState(() {
-      _logs.clear();
-    });
-  }
-
-  @override
-  void dispose() {
-    _realTimeTimer?.cancel();
-    DatabaseService.close();
-    _keyController.dispose();
-    _valueController.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.grey[50],
       appBar: AppBar(
-        title: Row(
-          children: [
-            Container(
-              padding: EdgeInsets.all(8),
-              decoration: BoxDecoration(
-                color: Colors.white.withValues(alpha: 0.2),
-                borderRadius: BorderRadius.circular(8),
+        title: const Text('ReaxDB Example'),
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(28),
+          child: Padding(
+            padding: const EdgeInsets.only(left: 16, bottom: 12),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                'One screen per feature of ReaxDB 2.0',
+                style: theme.textTheme.bodySmall,
               ),
-              child: Icon(Icons.storage, size: 24),
             ),
-            SizedBox(width: 12),
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'ReaxDB Demo',
-                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-                ),
-                Text(
-                  'High-Performance NoSQL Database',
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: Colors.white.withValues(alpha: 0.9),
-                  ),
-                ),
-              ],
-            ),
-          ],
+          ),
         ),
-        actions: [
-          if (_realTimeMode)
-            Container(
-              margin: EdgeInsets.only(right: 16),
-              padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              decoration: BoxDecoration(
-                color: Colors.green,
-                borderRadius: BorderRadius.circular(16),
+      ),
+      body: ListView.separated(
+        padding: const EdgeInsets.all(16),
+        itemCount: demos.length,
+        separatorBuilder: (_, __) => const SizedBox(height: 8),
+        itemBuilder: (BuildContext context, int index) {
+          final Demo demo = demos[index];
+          return Card(
+            child: ListTile(
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 16,
+                vertical: 8,
               ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.circle, size: 8, color: Colors.white),
-                  SizedBox(width: 4),
+              leading: Icon(demo.icon, color: theme.colorScheme.primary),
+              title: Text(demo.title),
+              subtitle: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  const SizedBox(height: 4),
+                  Text(demo.summary),
+                  const SizedBox(height: 6),
                   Text(
-                    'LIVE',
-                    style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+                    demo.api,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      fontFamily: 'monospace',
+                      color: theme.colorScheme.primary,
+                    ),
                   ),
                 ],
               ),
+              trailing: const Icon(Icons.chevron_right),
+              onTap:
+                  () => Navigator.of(
+                    context,
+                  ).push(MaterialPageRoute<void>(builder: demo.builder)),
             ),
-        ],
+          );
+        },
       ),
-      body:
-          _isLoading
-              ? Center(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    CircularProgressIndicator(strokeWidth: 3),
-                    SizedBox(height: 16),
-                    Text(
-                      'Initializing ReaxDB...',
-                      style: TextStyle(fontSize: 16, color: Colors.grey[600]),
-                    ),
-                  ],
-                ),
-              )
-              : SingleChildScrollView(
-                child: Column(
-                  children: [
-                    // Performance Stats
-                    PerformanceStatsCard(
-                      totalOperations: _totalOperations,
-                      successfulOperations: _successfulOperations,
-                      latencies: _latencies,
-                    ),
-
-                    // Control Panel with Demo Tests
-                    Container(
-                      margin: EdgeInsets.symmetric(horizontal: 16),
-                      child: Card(
-                        child: Padding(
-                          padding: EdgeInsets.all(20),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.stretch,
-                            children: [
-                              Row(
-                                children: [
-                                  Icon(
-                                    Icons.security,
-                                    color: Colors.red[700],
-                                    size: 20,
-                                  ),
-                                  SizedBox(width: 8),
-                                  Text(
-                                    'Database Demonstrations',
-                                    style: TextStyle(
-                                      fontSize: 18,
-                                      fontWeight: FontWeight.bold,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              SizedBox(height: 16),
-
-                              Row(
-                                children: [
-                                  Expanded(
-                                    child: ActionButton(
-                                      text: 'Security Tests',
-                                      onPressed: _runSecurityTests,
-                                      color: Colors.red[700]!,
-                                      icon: Icons.shield,
-                                    ),
-                                  ),
-                                  SizedBox(width: 8),
-                                  Expanded(
-                                    child: ActionButton(
-                                      text:
-                                          _realTimeMode
-                                              ? 'Stop Real-Time'
-                                              : 'Real-Time Test',
-                                      onPressed: _startRealTimeTest,
-                                      color:
-                                          _realTimeMode
-                                              ? Colors.orange[700]!
-                                              : Colors.green[700]!,
-                                      icon:
-                                          _realTimeMode
-                                              ? Icons.stop
-                                              : Icons.speed,
-                                      isActive: _realTimeMode,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              SizedBox(height: 12),
-
-                              Row(
-                                children: [
-                                  Expanded(
-                                    child: ActionButton(
-                                      text: 'Basic Stress',
-                                      onPressed: _runConcurrencyTest,
-                                      color: Colors.purple[700]!,
-                                      icon: Icons.fitness_center,
-                                    ),
-                                  ),
-                                  SizedBox(width: 8),
-                                  Expanded(
-                                    child: ActionButton(
-                                      text: 'Optimized 🚀',
-                                      onPressed: _runOptimizedConcurrencyTest,
-                                      color: Colors.green[700]!,
-                                      icon: Icons.rocket_launch,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              SizedBox(height: 12),
-
-                              SizedBox(
-                                width: double.infinity,
-                                child: ActionButton(
-                                  text: '💀 EXTREME STRESS (10K ops)',
-                                  onPressed: _runExtremeStressTest,
-                                  color: Colors.red[900]!,
-                                  icon: Icons.warning,
-                                ),
-                              ),
-                              SizedBox(height: 12),
-
-                              SizedBox(
-                                width: double.infinity,
-                                child: ActionButton(
-                                  text: '🔍 Secondary Indexes',
-                                  onPressed: () async {
-                                    final logs =
-                                        await DatabaseService.runSecondaryIndexTest();
-                                    logs.forEach(_addLog);
-                                  },
-                                  color: Colors.indigo[700]!,
-                                  icon: Icons.search,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
-
-                    // Console Output
-                    ConsoleWidget(logs: _logs, onClear: _clearLogs),
-                  ],
-                ),
-              ),
     );
   }
 }

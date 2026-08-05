@@ -1,0 +1,9 @@
+# Test runner configuration.
+#
+# Declaring the tags used in the suite keeps `dart test` from warning about
+# them and documents what each one means.
+tags:
+  slow:
+    # Sustained-load stress tests: they push megabytes through the storage
+    # engine, so they need more room than the default per-test timeout.
+    timeout: 4x

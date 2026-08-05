@@ -1,290 +1,420 @@
+import 'dart:typed_data';
+
+import 'package:reaxdb_dart/src/core/errors/exceptions.dart';
+import 'package:reaxdb_dart/src/core/indexing/index_manager.dart';
+import 'package:reaxdb_dart/src/core/indexing/secondary_index.dart';
+import 'package:reaxdb_dart/src/core/query/query_builder.dart';
+import 'package:reaxdb_dart/src/core/storage/storage_engine.dart';
 import 'package:test/test.dart';
-import 'package:reaxdb_dart/reaxdb_dart.dart';
-import 'dart:io';
+
+import '../support/query_test_harness.dart';
 
 void main() {
-  group('Secondary Index Tests', () {
-    late ReaxDB db;
-    final testPath = 'test/index_test_db';
+  group('IndexValueCodec ordering', () {
+    int cmp(dynamic a, dynamic b) => compareBytes(
+      IndexValueCodec.encodeValue(a),
+      IndexValueCodec.encodeValue(b),
+    );
 
-    setUp(() async {
-      // Clean up any existing test database
-      final dir = Directory(testPath);
-      if (await dir.exists()) {
-        await dir.delete(recursive: true);
-      }
-
-      // Create database
-      db = await ReaxDB.open('index_db', path: testPath);
+    test('negative integers sort below positive integers', () {
+      // Raw big-endian int64 made negatives sort ABOVE positives.
+      expect(cmp(-5, 3), lessThan(0));
+      expect(cmp(-1, 0), lessThan(0));
+      expect(cmp(-1000000, -1), lessThan(0));
     });
 
-    tearDown(() async {
-      await db.close();
-
-      // Clean up test database
-      final dir = Directory(testPath);
-      if (await dir.exists()) {
-        await dir.delete(recursive: true);
-      }
+    test('negative doubles keep numeric order among themselves', () {
+      // Raw float64 bits reversed the order of negative doubles.
+      expect(cmp(-2.5, -1.5), lessThan(0));
+      expect(cmp(-0.1, 0.1), lessThan(0));
     });
 
-    test('should create and list indexes', () async {
-      // Create indexes
-      await db.createIndex('users', 'email');
-      await db.createIndex('users', 'age');
-      await db.createIndex('products', 'price');
-
-      // List indexes
-      final indexes = db.listIndexes();
-
-      expect(indexes, contains('users.email'));
-      expect(indexes, contains('users.age'));
-      expect(indexes, contains('products.price'));
-      expect(indexes.length, equals(3));
+    test('int and double with equal value encode identically', () {
+      // Tags 2 and 3 used to give int and double disjoint key spaces.
+      expect(
+        IndexValueCodec.encodeValue(5),
+        equals(IndexValueCodec.encodeValue(5.0)),
+      );
+      expect(cmp(4, 4.5), lessThan(0));
+      expect(cmp(4.5, 5), lessThan(0));
     });
 
-    test('should drop indexes', () async {
-      // Create indexes
-      await db.createIndex('users', 'email');
-      await db.createIndex('users', 'age');
-
-      // Drop one index
-      await db.dropIndex('users', 'email');
-
-      // Verify
-      final indexes = db.listIndexes();
-      expect(indexes, isNot(contains('users.email')));
-      expect(indexes, contains('users.age'));
+    test('strings use utf8 bytes, not UTF-16 code units', () {
+      final Uint8List encoded = IndexValueCodec.encodeValue('eé');
+      // 'e' is 1 byte, e-acute is 2 utf8 bytes, plus tag and terminator.
+      expect(encoded.length, equals(1 + 1 + 2 + 1));
     });
 
-    test('should prevent duplicate index creation', () async {
-      await db.createIndex('users', 'email');
-
-      // Try to create same index again
-      expect(() => db.createIndex('users', 'email'), throwsStateError);
-    });
-
-    test('should query by indexed field', () async {
-      // Create index
-      await db.createIndex('users', 'email');
-
-      // Insert test data
-      await db.put('users:1', {
-        'id': '1',
-        'name': 'John',
-        'email': 'john@test.com',
-        'age': 25,
-      });
-
-      await db.put('users:2', {
-        'id': '2',
-        'name': 'Jane',
-        'email': 'jane@test.com',
-        'age': 30,
-      });
-
-      // Query by email
-      final results = await db.where('users', 'email', 'jane@test.com');
-
-      expect(results.length, equals(1));
-      expect(results[0]['name'], equals('Jane'));
-      expect(results[0]['email'], equals('jane@test.com'));
-    });
-
-    test('should handle range queries', () async {
-      // Create index
-      await db.createIndex('products', 'price');
-
-      // Insert products
-      final products = [
-        {'id': '1', 'name': 'Laptop', 'price': 999.99},
-        {'id': '2', 'name': 'Mouse', 'price': 29.99},
-        {'id': '3', 'name': 'Keyboard', 'price': 79.99},
-        {'id': '4', 'name': 'Monitor', 'price': 299.99},
-        {'id': '5', 'name': 'Headphones', 'price': 149.99},
+    test('cross-type total order: null < bool < num < String < List < Map', () {
+      final List<dynamic> ordered = [
+        null,
+        false,
+        true,
+        -7,
+        3.14,
+        'a',
+        [1],
+        {'k': 1},
       ];
-
-      for (final product in products) {
-        await db.put('products:${product['id']}', product);
+      for (int i = 0; i < ordered.length - 1; i++) {
+        expect(
+          cmp(ordered[i], ordered[i + 1]),
+          lessThan(0),
+          reason: '${ordered[i]} should sort before ${ordered[i + 1]}',
+        );
       }
-
-      // Query products between $50 and $200
-      final results =
-          await db
-              .collection('products')
-              .whereBetween('price', 50.0, 200.0)
-              .orderBy('price')
-              .find();
-
-      expect(results.length, equals(2));
-      expect(results[0]['name'], equals('Keyboard'));
-      expect(results[1]['name'], equals('Headphones'));
     });
 
-    test('should update index on document update', () async {
-      // Create index
-      await db.createIndex('users', 'email');
-
-      // Insert user
-      await db.put('users:1', {
-        'id': '1',
-        'name': 'John',
-        'email': 'john@old.com',
-      });
-
-      // Verify old email
-      var results = await db.where('users', 'email', 'john@old.com');
-      expect(results.length, equals(1));
-
-      // Update email
-      await db.put('users:1', {
-        'id': '1',
-        'name': 'John',
-        'email': 'john@new.com',
-      });
-
-      // Old email should not find anything
-      results = await db.where('users', 'email', 'john@old.com');
-      expect(results.length, equals(0));
-
-      // New email should find the user
-      results = await db.where('users', 'email', 'john@new.com');
-      expect(results.length, equals(1));
-      expect(results[0]['email'], equals('john@new.com'));
+    test('numeric strings compare as strings, numbers as numbers', () {
+      expect(cmp('10', '9'), lessThan(0)); // byte order for strings
+      expect(cmp(10, 9), greaterThan(0)); // numeric order for numbers
     });
 
-    test('should handle complex queries', () async {
-      // Create indexes
-      await db.createIndex('users', 'age');
-      await db.createIndex('users', 'city');
+    test('lists compare element-wise and maps structurally', () {
+      expect(cmp([1, 2], [1, 3]), lessThan(0));
+      expect(cmp([1], [1, 0]), lessThan(0));
+      expect(cmp({'a': 1}, {'a': 2}), lessThan(0));
+      expect(cmp({'b': 1, 'a': 2}, {'a': 2, 'b': 1}), equals(0));
+    });
 
-      // Insert users
-      final users = [
-        {'id': '1', 'name': 'John', 'age': 25, 'city': 'NYC'},
-        {'id': '2', 'name': 'Jane', 'age': 30, 'city': 'LA'},
-        {'id': '3', 'name': 'Bob', 'age': 35, 'city': 'NYC'},
-        {'id': '4', 'name': 'Alice', 'age': 28, 'city': 'Chicago'},
-        {'id': '5', 'name': 'Charlie', 'age': 22, 'city': 'NYC'},
-      ];
+    test('compareValues agrees with encoding order', () {
+      expect(compareValues(-5, 3), lessThan(0));
+      expect(compareValues(5, 5.0), equals(0));
+      expect(valuesEqual([1, 2], [1, 2]), isTrue);
+      expect(valuesEqual(null, null), isTrue);
+    });
 
-      for (final user in users) {
-        await db.put('users:${user['id']}', user);
+    test('skipValue walks every encoding shape', () {
+      for (final dynamic value in [
+        null,
+        true,
+        false,
+        42,
+        -3.5,
+        'text',
+        [1, 'two', null],
+        {
+          'k': [1, 2],
+          'j': 'v',
+        },
+      ]) {
+        final Uint8List encoded = IndexValueCodec.encodeValue(value);
+        expect(
+          IndexValueCodec.skipValue(encoded, 0),
+          equals(encoded.length),
+          reason: 'skipValue must consume exactly the encoding of $value',
+        );
       }
-
-      // Find young users in NYC
-      final results =
-          await db
-              .collection('users')
-              .whereEquals('city', 'NYC')
-              .whereLessThan('age', 30)
-              .orderBy('age')
-              .find();
-
-      expect(results.length, equals(2));
-      expect(results[0]['name'], equals('Charlie'));
-      expect(results[1]['name'], equals('John'));
     });
 
-    test('should handle pagination', () async {
-      // Create index
-      await db.createIndex('users', 'name');
-
-      // Insert users
-      for (int i = 1; i <= 10; i++) {
-        await db.put('users:$i', {
-          'id': '$i',
-          'name': 'User${i.toString().padLeft(2, '0')}',
-        });
+    test('document id round-trips through entry keys', () {
+      final IndexDefinition definition = IndexDefinition(
+        collection: 'users',
+        fields: const ['age'],
+      );
+      for (final String docId in ['1', 'abc-def', 'user:42', 'a b']) {
+        final Uint8List key = IndexKeyCodec.entryKey(definition, [30], docId);
+        expect(IndexKeyCodec.docIdFromEntryKey(definition, key), equals(docId));
       }
-
-      // First page
-      final page1 =
-          await db.collection('users').orderBy('name').limit(3).find();
-
-      expect(page1.length, equals(3));
-      expect(page1[0]['name'], equals('User01'));
-      expect(page1[2]['name'], equals('User03'));
-
-      // Second page
-      final page2 =
-          await db
-              .collection('users')
-              .orderBy('name')
-              .limit(3)
-              .offset(3)
-              .find();
-
-      expect(page2.length, equals(3));
-      expect(page2[0]['name'], equals('User04'));
-      expect(page2[2]['name'], equals('User06'));
     });
 
-    test('should handle null values in indexed fields', () async {
-      // Create index
-      await db.createIndex('users', 'email');
+    test('prefixUpperBound produces the smallest greater key', () {
+      expect(
+        IndexKeyCodec.prefixUpperBound(Uint8List.fromList([1, 2, 3])),
+        equals(Uint8List.fromList([1, 2, 4])),
+      );
+      expect(
+        IndexKeyCodec.prefixUpperBound(Uint8List.fromList([1, 0xFF])),
+        equals(Uint8List.fromList([2])),
+      );
+      expect(
+        IndexKeyCodec.prefixUpperBound(Uint8List.fromList([0xFF, 0xFF])),
+        isNull,
+      );
+    });
+  });
 
-      // Insert user without email
-      await db.put('users:1', {
-        'id': '1',
-        'name': 'John',
-        // no email field
-      });
+  group('IndexManager', () {
+    late InMemoryStorageEngine engine;
+    late IndexManager indexManager;
+    late PipelineDocumentStore store;
 
-      // Insert user with null email
-      await db.put('users:2', {'id': '2', 'name': 'Jane', 'email': null});
-
-      // Insert user with email
-      await db.put('users:3', {
-        'id': '3',
-        'name': 'Bob',
-        'email': 'bob@test.com',
-      });
-
-      // Query for specific email
-      final results = await db.where('users', 'email', 'bob@test.com');
-      expect(results.length, equals(1));
-      expect(results[0]['name'], equals('Bob'));
+    setUp(() {
+      final harness = buildHarness();
+      engine = harness.engine;
+      indexManager = harness.indexManager;
+      store = harness.store;
     });
 
-    test('should measure index performance', () async {
-      // Insert many users without index
-      final stopwatch1 = Stopwatch()..start();
+    QueryCondition eq(String field, dynamic value) => QueryCondition(
+      field: field,
+      operator: QueryOperator.equals,
+      value: value,
+    );
 
-      for (int i = 1; i <= 100; i++) {
-        await db.put('users:$i', {
-          'id': '$i',
-          'name': 'User $i',
-          'email': 'user$i@test.com',
-          'score': i * 10,
-        });
-      }
+    test('createIndex backfills existing documents', () async {
+      // The old _rebuildIndex was a stub: the planner trusted an EMPTY
+      // index and every query on pre-existing data returned [].
+      await store.putDocument('users', '1', {'name': 'ana', 'age': 30});
+      await store.putDocument('users', '2', {'name': 'bob', 'age': 25});
+      await store.putDocument('users', 'uuid-3', {'name': 'eve', 'age': 30});
 
-      // Search without index
-      await db
-          .collection('users')
-          .whereEquals('email', 'user50@test.com')
-          .findOne();
+      await indexManager.createIndex('users', 'age');
 
-      stopwatch1.stop();
-      final timeWithoutIndex = stopwatch1.elapsedMicroseconds;
+      final Set<String>? ids = await indexManager.candidateIds('users', [
+        eq('age', 30),
+      ]);
+      expect(ids, equals({'1', 'uuid-3'}));
+    });
 
-      // Create index
-      await db.createIndex('users', 'email');
+    test(
+      'candidateIds returns null when no index can serve the query',
+      () async {
+        await indexManager.createIndex('users', 'age');
+        expect(
+          await indexManager.candidateIds('users', [eq('name', 'ana')]),
+          isNull,
+        );
+        expect(await indexManager.candidateIds('users', []), isNull);
+        expect(
+          await indexManager.candidateIds('other', [eq('age', 1)]),
+          isNull,
+        );
+      },
+    );
 
-      // Search with index
-      final stopwatch2 = Stopwatch()..start();
-      await db
-          .collection('users')
-          .whereEquals('email', 'user50@test.com')
-          .findOne();
-      stopwatch2.stop();
-      final timeWithIndex = stopwatch2.elapsedMicroseconds;
+    test(
+      'candidateIds returns an empty set only as a definitive answer',
+      () async {
+        await indexManager.createIndex('users', 'age');
+        final Set<String>? ids = await indexManager.candidateIds('users', [
+          eq('age', 99),
+        ]);
+        expect(ids, isNotNull);
+        expect(ids, isEmpty);
+      },
+    );
 
-      print('Query without index: $timeWithoutIndexμs');
-      print('Query with index: $timeWithIndexμs');
+    test('updating an indexed field removes the old posting', () async {
+      // put() used to call only onDocumentInsert, so old postings stayed
+      // forever and the index grew without bound.
+      await indexManager.createIndex('users', 'age');
+      await store.putDocument('users', '1', {'age': 30});
+      await store.putDocument('users', '1', {'age': 31});
 
-      // Index should be faster (though for small datasets the difference might be minimal)
-      expect(timeWithIndex, lessThanOrEqualTo(timeWithoutIndex));
+      expect(
+        await indexManager.candidateIds('users', [eq('age', 30)]),
+        isEmpty,
+      );
+      expect(
+        await indexManager.candidateIds('users', [eq('age', 31)]),
+        equals({'1'}),
+      );
+    });
+
+    test('deleting a document removes its postings', () async {
+      await indexManager.createIndex('users', 'age');
+      await store.putDocument('users', '1', {'age': 30});
+      await store.deleteDocument('users', '1');
+      expect(
+        await indexManager.candidateIds('users', [eq('age', 30)]),
+        isEmpty,
+      );
+    });
+
+    test(
+      'buildIndexOps returns ops for atomic batching with the document',
+      () async {
+        await indexManager.createIndex('users', 'age');
+        final List<WriteOp> insertOps = await indexManager.buildIndexOps(
+          collection: 'users',
+          docId: '1',
+          oldDoc: null,
+          newDoc: {'age': 30},
+        );
+        expect(insertOps, hasLength(1));
+        expect(insertOps.single.isDelete, isFalse);
+
+        final List<WriteOp> updateOps = await indexManager.buildIndexOps(
+          collection: 'users',
+          docId: '1',
+          oldDoc: {'age': 30},
+          newDoc: {'age': 31},
+        );
+        expect(updateOps.where((WriteOp o) => o.isDelete), hasLength(1));
+        expect(updateOps.where((WriteOp o) => !o.isDelete), hasLength(1));
+
+        final List<WriteOp> noChange = await indexManager.buildIndexOps(
+          collection: 'users',
+          docId: '1',
+          oldDoc: {'age': 30, 'name': 'a'},
+          newDoc: {'age': 30, 'name': 'b'},
+        );
+        expect(noChange, isEmpty, reason: 'unchanged indexed value: no ops');
+      },
+    );
+
+    test('null and missing indexed values are queryable', () async {
+      await indexManager.createIndex('users', 'nickname');
+      await store.putDocument('users', '1', {'nickname': 'ace'});
+      await store.putDocument('users', '2', {'nickname': null});
+      await store.putDocument('users', '3', {'name': 'no nickname field'});
+
+      expect(
+        await indexManager.candidateIds('users', [eq('nickname', null)]),
+        equals({'2', '3'}),
+      );
+    });
+
+    test('in-place mutation of an indexed list is reindexed', () async {
+      // updateEntry compared old != new with ==, so a mutated list (same
+      // identity) was never reindexed.
+      await indexManager.createIndex('users', 'tags');
+      final List<String> tags = ['a'];
+      await store.putDocument('users', '1', {'tags': tags});
+      tags.add('b');
+      await store.putDocument('users', '1', {'tags': tags});
+
+      expect(
+        await indexManager.candidateIds('users', [
+          eq('tags', ['a']),
+        ]),
+        isEmpty,
+      );
+      expect(
+        await indexManager.candidateIds('users', [
+          eq('tags', ['a', 'b']),
+        ]),
+        equals({'1'}),
+      );
+    });
+
+    test('whereEquals(field, 5) matches documents storing 5.0', () async {
+      await indexManager.createIndex('m', 'score');
+      await store.putDocument('m', '1', {'score': 5.0});
+      await store.putDocument('m', '2', {'score': 5});
+      expect(
+        await indexManager.candidateIds('m', [eq('score', 5)]),
+        equals({'1', '2'}),
+      );
+    });
+
+    test('range conditions with negative numbers', () async {
+      await indexManager.createIndex('t', 'v');
+      await store.putDocument('t', 'a', {'v': -10});
+      await store.putDocument('t', 'b', {'v': -1});
+      await store.putDocument('t', 'c', {'v': 0});
+      await store.putDocument('t', 'd', {'v': 7});
+
+      final Set<String>? ids = await indexManager.candidateIds('t', [
+        const QueryCondition(
+          field: 'v',
+          operator: QueryOperator.greaterThan,
+          value: -5,
+        ),
+      ]);
+      expect(ids, equals({'b', 'c', 'd'}));
+
+      final Set<String>? between = await indexManager.candidateIds('t', [
+        const QueryCondition(
+          field: 'v',
+          operator: QueryOperator.between,
+          value: [-10, 0],
+        ),
+      ]);
+      expect(between, equals({'a', 'b', 'c'}));
+    });
+
+    test('nested dotted fields are fully indexed', () async {
+      // entry.key.split('.')[1] used to truncate nested field names.
+      await indexManager.createIndex('users', 'address.city');
+      await store.putDocument('users', '1', {
+        'address': {'city': 'lima'},
+      });
+      await store.putDocument('users', '2', {
+        'address': {'city': 'quito'},
+      });
+      expect(
+        await indexManager.candidateIds('users', [eq('address.city', 'lima')]),
+        equals({'1'}),
+      );
+    });
+
+    test('compound index serves equality plus range', () async {
+      await indexManager.createCompoundIndex('users', ['city', 'age']);
+      await store.putDocument('users', '1', {'city': 'lima', 'age': 20});
+      await store.putDocument('users', '2', {'city': 'lima', 'age': 40});
+      await store.putDocument('users', '3', {'city': 'quito', 'age': 40});
+
+      final Set<String>? ids = await indexManager.candidateIds('users', [
+        eq('city', 'lima'),
+        const QueryCondition(
+          field: 'age',
+          operator: QueryOperator.greaterThan,
+          value: 25,
+        ),
+      ]);
+      expect(ids, equals({'2'}));
+
+      expect(
+        await indexManager.candidateIds('users', [eq('city', 'lima')]),
+        equals({'1', '2'}),
+      );
+    });
+
+    test(
+      'collections with underscores survive persistence round-trip',
+      () async {
+        // loadIndexes used to split '${collection}_$field' on '_', so
+        // user_profiles came back as collection "user".
+        await store.putDocument('user_profiles', 'p1', {'level': 3});
+        await indexManager.createIndex('user_profiles', 'level');
+
+        final IndexManager reloaded = IndexManager(
+          storage: engine,
+          decodeDocument: decodeJsonDocument,
+        );
+        await reloaded.loadIndexes();
+
+        expect(
+          reloaded.listIndexes('user_profiles').single.fields,
+          equals(['level']),
+        );
+        expect(
+          await reloaded.candidateIds('user_profiles', [eq('level', 3)]),
+          equals({'p1'}),
+        );
+      },
+    );
+
+    test('dropIndex removes postings and metadata', () async {
+      await store.putDocument('users', '1', {'age': 30});
+      await indexManager.createIndex('users', 'age');
+      await indexManager.dropIndex('users', ['age']);
+
+      expect(await indexManager.candidateIds('users', [eq('age', 30)]), isNull);
+      final IndexManager reloaded = IndexManager(
+        storage: engine,
+        decodeDocument: decodeJsonDocument,
+      );
+      await reloaded.loadIndexes();
+      expect(reloaded.listIndexes(), isEmpty);
+    });
+
+    test('duplicate createIndex throws QueryException', () async {
+      await indexManager.createIndex('users', 'age');
+      expect(
+        () => indexManager.createIndex('users', 'age'),
+        throwsA(isA<QueryException>()),
+      );
+    });
+
+    test('index entries never collide with document keys', () async {
+      await indexManager.createIndex('users', 'age');
+      await store.putDocument('users', '1', {'age': 30});
+      // Scanning the document prefix must yield exactly the one document.
+      final List<String> ids = await store.scanDocumentIds('users').toList();
+      expect(ids, equals(['1']));
     });
   });
 }

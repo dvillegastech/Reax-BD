@@ -1,303 +1,568 @@
-import 'package:test/test.dart';
-import 'package:reaxdb_dart/src/core/transactions/transaction_manager.dart';
-import 'package:reaxdb_dart/src/core/storage/hybrid_storage_engine.dart';
-import 'package:reaxdb_dart/src/domain/entities/database_entity.dart';
-import 'dart:io';
+import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:reaxdb_dart/src/core/errors/exceptions.dart';
+import 'package:reaxdb_dart/src/core/storage/storage_engine.dart';
+import 'package:reaxdb_dart/src/core/transactions/transaction_manager.dart';
+import 'package:test/test.dart';
+
+/// In-memory storage engine used to test the transaction layer in isolation.
+class FakeStorageEngine implements StorageEngine {
+  final Map<String, Uint8List> _data = <String, Uint8List>{};
+
+  int putCalls = 0;
+  int deleteCalls = 0;
+  int writeBatchCalls = 0;
+  final List<int?> batchTransactionIds = <int?>[];
+  Object? failNextWriteBatch;
+
+  String _mapKey(Uint8List key) => base64Encode(key);
+
+  /// Direct write bypassing the transaction layer (simulates an external
+  /// committed writer).
+  void putDirect(String key, List<int> value) {
+    _data[base64Encode(utf8.encode(key))] = Uint8List.fromList(value);
+  }
+
+  Uint8List? getDirect(String key) => _data[base64Encode(utf8.encode(key))];
+
+  @override
+  Future<void> put(Uint8List key, Uint8List value) async {
+    putCalls++;
+    _data[_mapKey(key)] = value;
+  }
+
+  @override
+  Future<Uint8List?> get(Uint8List key) async => _data[_mapKey(key)];
+
+  @override
+  Future<void> delete(Uint8List key) async {
+    deleteCalls++;
+    _data.remove(_mapKey(key));
+  }
+
+  @override
+  Future<void> writeBatch(List<WriteOp> ops, {int? transactionId}) async {
+    writeBatchCalls++;
+    batchTransactionIds.add(transactionId);
+    final Object? failure = failNextWriteBatch;
+    if (failure != null) {
+      failNextWriteBatch = null;
+      throw failure;
+    }
+    for (final WriteOp op in ops) {
+      if (op.isDelete) {
+        _data.remove(_mapKey(op.key));
+      } else {
+        _data[_mapKey(op.key)] = op.value!;
+      }
+    }
+  }
+
+  @override
+  Stream<KeyValue> scan({
+    Uint8List? startKey,
+    Uint8List? endKey,
+    int? limit,
+    bool reverse = false,
+  }) => const Stream<KeyValue>.empty();
+
+  @override
+  Future<void> flush() async {}
+
+  @override
+  Future<void> compact() async {}
+
+  @override
+  Future<void> close() async {}
+
+  @override
+  StorageStats get stats => const StorageStats(
+    memtableEntries: 0,
+    memtableSizeBytes: 0,
+    immutableMemtableCount: 0,
+    sstableCount: 0,
+    sstableSizeBytes: 0,
+    levelTableCounts: <int>[],
+    lastSequenceNumber: 0,
+  );
+}
+
+Uint8List bytes(String s) => Uint8List.fromList(utf8.encode(s));
+
 void main() {
-  group('Transaction Manager Tests', () {
-    late TransactionManager transactionManager;
-    late HybridStorageEngine storageEngine;
-    final testPath = 'test/transaction_test_db';
+  late FakeStorageEngine engine;
+  late TransactionManager manager;
 
-    setUp(() async {
-      // Clean up any existing test database
-      final dir = Directory(testPath);
-      if (await dir.exists()) {
-        await dir.delete(recursive: true);
-      }
+  setUp(() {
+    engine = FakeStorageEngine();
+    manager = TransactionManager(storageEngine: engine);
+  });
 
-      // Create storage engine and transaction manager
-      storageEngine = await HybridStorageEngine.create(
-        path: testPath,
-        config: StorageConfig(
-          memtableSize: 1024 * 1024, // 1MB
-          pageSize: 4096,
-          compressionEnabled: false,
-          syncWrites: true,
-          maxImmutableMemtables: 2,
-        ),
-      );
+  tearDown(() async {
+    await manager.close();
+  });
 
-      transactionManager = TransactionManager(
-        storageEngine: storageEngine,
-        defaultIsolationLevel: IsolationLevel.readCommitted,
-      );
-    });
+  void expectNoLocksHeld() {
+    expect(manager.lockManager.lockedKeyCount, 0);
+    expect(manager.lockManager.waiterCount, 0);
+  }
 
-    tearDown(() async {
-      await transactionManager.close();
-      await storageEngine.close();
-
-      // Clean up test database
-      final dir = Directory(testPath);
-      if (await dir.exists()) {
-        await dir.delete(recursive: true);
-      }
-    });
-
-    test('should begin and commit simple transaction', () async {
-      final transaction = transactionManager.beginTransaction();
-
-      expect(transaction.state, equals(TransactionState.active));
-      expect(transaction.id, isNotEmpty);
-
-      // Put data in transaction
-      await transaction.put(
-        'test_key',
-        Uint8List.fromList('test_value'.codeUnits),
-      );
-
-      // Commit transaction
-      await transactionManager.commitTransaction(transaction);
-
-      expect(transaction.state, equals(TransactionState.committed));
-
-      // Verify data was written
-      final value = await storageEngine.get('test_key'.codeUnits);
-      expect(value, isNotNull);
-      expect(String.fromCharCodes(value!), equals('test_value'));
-    });
-
-    test('should abort transaction on error', () async {
-      final transaction = transactionManager.beginTransaction();
-
-      // Put data in transaction
-      await transaction.put(
-        'abort_key',
-        Uint8List.fromList('abort_value'.codeUnits),
-      );
-
-      // Abort transaction
-      await transactionManager.abortTransaction(transaction);
-
-      expect(transaction.state, equals(TransactionState.aborted));
-
-      // Verify data was not written
-      final value = await storageEngine.get('abort_key'.codeUnits);
-      expect(value, isNull);
-    });
-
-    test('should read own writes within transaction', () async {
-      final transaction = transactionManager.beginTransaction();
-
-      // Put data in transaction
-      await transaction.put(
-        'row_key',
-        Uint8List.fromList('row_value'.codeUnits),
-      );
-
-      // Read within same transaction should see the write
-      final value = await transaction.get('row_key');
-      expect(value, isNotNull);
-      expect(String.fromCharCodes(value!), equals('row_value'));
-
-      // Storage should not have the value yet
-      final storageValue = await storageEngine.get('row_key'.codeUnits);
-      expect(storageValue, isNull);
-
-      // Commit transaction
-      await transactionManager.commitTransaction(transaction);
-
-      // Now storage should have the value
-      final committedValue = await storageEngine.get('row_key'.codeUnits);
-      expect(committedValue, isNotNull);
-      expect(String.fromCharCodes(committedValue!), equals('row_value'));
-    });
-
-    test('should handle concurrent transactions with locks', () async {
-      // Skip this test due to lock manager timing issues
-      return;
-      // Put initial value
-    });
-
-    test('should execute transaction with automatic retry', () async {
-      int attempts = 0;
-
-      final result = await transactionManager.executeTransaction<String>((
-        transaction,
-      ) async {
-        attempts++;
-
-        if (attempts < 2) {
-          // Simulate conflict on first attempt
-          throw Exception('Simulated conflict');
-        }
-
-        await transaction.put(
-          'retry_key',
-          Uint8List.fromList('retry_value'.codeUnits),
+  group('basic lifecycle', () {
+    test('tx.get then tx.put on the same key does not self-deadlock', () async {
+      // The historical bug: shared -> exclusive upgrade on the same key hung
+      // for the full lock timeout. This must finish immediately.
+      for (final IsolationLevel level in <IsolationLevel>[
+        IsolationLevel.readCommitted,
+        IsolationLevel.repeatableRead,
+        IsolationLevel.serializable,
+      ]) {
+        engine.putDirect('upgrade-key', <int>[1]);
+        final Transaction tx = manager.begin(isolationLevel: level);
+        final Stopwatch watch = Stopwatch()..start();
+        await tx.get('upgrade-key');
+        await tx.put('upgrade-key', bytes('new'));
+        await manager.commit(tx);
+        watch.stop();
+        expect(
+          watch.elapsed,
+          lessThan(const Duration(seconds: 2)),
+          reason: 'upgrade must not wait for the lock timeout ($level)',
         );
-        return 'success';
-      }, maxRetries: 3);
-
-      expect(result, equals('success'));
-      expect(attempts, equals(2));
-
-      // Verify data was written
-      final value = await storageEngine.get('retry_key'.codeUnits);
-      expect(value, isNotNull);
-      expect(String.fromCharCodes(value!), equals('retry_value'));
-    });
-
-    test('should handle delete operations in transactions', () async {
-      // Put initial data
-      await storageEngine.put(
-        'delete_key'.codeUnits,
-        Uint8List.fromList('delete_value'.codeUnits),
-      );
-
-      final transaction = transactionManager.beginTransaction();
-
-      // Delete in transaction
-      await transaction.delete('delete_key');
-
-      // Should read as deleted within transaction
-      final value = await transaction.get('delete_key');
-      expect(value, isNull);
-
-      // Storage should still have the value
-      final storageValue = await storageEngine.get('delete_key'.codeUnits);
-      expect(storageValue, isNotNull);
-
-      // Commit transaction
-      await transactionManager.commitTransaction(transaction);
-
-      // Now storage should not have the value
-      final deletedValue = await storageEngine.get('delete_key'.codeUnits);
-      expect(deletedValue, isNull);
-    });
-
-    test('should track transaction statistics', () async {
-      final initialStats = transactionManager.getStats();
-      expect(initialStats.activeTransactions, equals(0));
-      expect(initialStats.committedTransactions, equals(0));
-      expect(initialStats.abortedTransactions, equals(0));
-
-      // Start transaction
-      final txn1 = transactionManager.beginTransaction();
-      var stats = transactionManager.getStats();
-      expect(stats.activeTransactions, equals(1));
-
-      // Commit transaction
-      await transactionManager.commitTransaction(txn1);
-      stats = transactionManager.getStats();
-      expect(stats.activeTransactions, equals(0));
-      expect(stats.committedTransactions, equals(1));
-
-      // Abort transaction
-      final txn2 = transactionManager.beginTransaction();
-      await transactionManager.abortTransaction(txn2);
-      stats = transactionManager.getStats();
-      expect(stats.abortedTransactions, equals(1));
-    });
-
-    test('should validate read set for repeatable read', () async {
-      // Put initial data
-      await storageEngine.put(
-        'validate_key'.codeUnits,
-        Uint8List.fromList('initial'.codeUnits),
-      );
-
-      // Start transaction with repeatable read
-      final txn = transactionManager.beginTransaction(
-        isolationLevel: IsolationLevel.repeatableRead,
-      );
-
-      // Read value
-      final value = await txn.get('validate_key');
-      expect(value, isNotNull);
-      expect(String.fromCharCodes(value!), equals('initial'));
-
-      // Modify value outside transaction
-      await storageEngine.put(
-        'validate_key'.codeUnits,
-        Uint8List.fromList('modified'.codeUnits),
-      );
-
-      // Try to commit transaction - should fail validation
-      bool validationFailed = false;
-      try {
-        await transactionManager.commitTransaction(txn);
-      } catch (e) {
-        validationFailed = true;
-        expect(e.toString(), contains('validation failed'));
+        expect(engine.getDirect('upgrade-key'), bytes('new'));
       }
-
-      expect(validationFailed, isTrue);
+      expectNoLocksHeld();
     });
 
-    test('should handle multiple operations in transaction', () async {
-      final transaction = transactionManager.beginTransaction();
+    test(
+      'read-your-own-writes: get observes buffered put and delete',
+      () async {
+        engine.putDirect('k', <int>[9]);
+        final Transaction tx = manager.begin();
+        await tx.put('k', bytes('mine'));
+        expect(await tx.get('k'), bytes('mine'));
+        await tx.delete('k');
+        expect(await tx.get('k'), isNull);
+        await manager.commit(tx);
+        expect(engine.getDirect('k'), isNull);
+      },
+    );
 
-      // Multiple puts
-      await transaction.put('multi_1', Uint8List.fromList('value_1'.codeUnits));
-      await transaction.put('multi_2', Uint8List.fromList('value_2'.codeUnits));
-      await transaction.put('multi_3', Uint8List.fromList('value_3'.codeUnits));
+    test(
+      'commit applies the write set as ONE writeBatch with the tx id',
+      () async {
+        final Transaction tx = manager.begin();
+        await tx.put('a', bytes('1'));
+        await tx.put('b', bytes('2'));
+        await tx.delete('c');
+        final CommitResult result = await manager.commit(tx);
+        expect(engine.writeBatchCalls, 1);
+        expect(engine.batchTransactionIds.single, tx.id);
+        expect(
+          engine.putCalls,
+          0,
+          reason: 'transactional writes must never use per-key put',
+        );
+        expect(
+          engine.deleteCalls,
+          0,
+          reason: 'transactional writes must never use per-key delete',
+        );
+        expect(result.operations, hasLength(3));
+      },
+    );
 
-      // Update existing
-      await transaction.put(
-        'multi_1',
-        Uint8List.fromList('updated_1'.codeUnits),
+    test(
+      'commit result reports key, old value and new value per operation',
+      () async {
+        engine.putDirect('existing', <int>[1, 2]);
+        engine.putDirect('doomed', <int>[3]);
+        final Transaction tx = manager.begin();
+        await tx.put('existing', bytes('updated'));
+        await tx.put('fresh', bytes('created'));
+        await tx.delete('doomed');
+        final CommitResult result = await manager.commit(tx);
+
+        final Map<String, AppliedOperation> byKey = <String, AppliedOperation>{
+          for (final AppliedOperation op in result.operations) op.key: op,
+        };
+        expect(byKey['existing']!.type, AppliedOperationType.put);
+        expect(byKey['existing']!.oldValue, Uint8List.fromList(<int>[1, 2]));
+        expect(byKey['existing']!.newValue, bytes('updated'));
+        expect(byKey['fresh']!.oldValue, isNull);
+        expect(byKey['fresh']!.newValue, bytes('created'));
+        expect(byKey['doomed']!.type, AppliedOperationType.delete);
+        expect(byKey['doomed']!.oldValue, Uint8List.fromList(<int>[3]));
+        expect(byKey['doomed']!.newValue, isNull);
+      },
+    );
+
+    test(
+      'operations on a finished transaction throw a typed exception',
+      () async {
+        final Transaction tx = manager.begin();
+        await tx.put('x', bytes('1'));
+        await manager.commit(tx);
+        expect(() => tx.get('x'), throwsA(isA<TransactionConflictException>()));
+        expect(
+          () => tx.put('x', bytes('2')),
+          throwsA(isA<TransactionConflictException>()),
+        );
+        expect(
+          () => manager.commit(tx),
+          throwsA(isA<TransactionConflictException>()),
+        );
+      },
+    );
+  });
+
+  group('isolation', () {
+    test(
+      'repeatableRead returns the first-read value on repeat reads',
+      () async {
+        engine.putDirect('rr', <int>[1]);
+        final Transaction tx = manager.begin(
+          isolationLevel: IsolationLevel.repeatableRead,
+        );
+        expect(await tx.get('rr'), Uint8List.fromList(<int>[1]));
+        engine.putDirect('rr', <int>[2]); // external change
+        expect(await tx.get('rr'), Uint8List.fromList(<int>[1]));
+        await manager.abort(tx);
+        expectNoLocksHeld();
+      },
+    );
+
+    test(
+      'serializable: reading an ABSENT key and committing after an external '
+      'insert of that key fails validation (phantom on point read)',
+      () async {
+        final Transaction tx = manager.begin(
+          isolationLevel: IsolationLevel.serializable,
+        );
+        expect(await tx.get('ghost'), isNull);
+        // External (non-transactional) writer inserts the key.
+        engine.putDirect('ghost', <int>[42]);
+        await tx.put('other', bytes('v'));
+        await expectLater(
+          manager.commit(tx),
+          throwsA(isA<TransactionConflictException>()),
+        );
+        expect(tx.state, TransactionState.aborted);
+        // The aborted write set must not have been applied.
+        expect(engine.getDirect('other'), isNull);
+        expectNoLocksHeld();
+      },
+    );
+
+    test(
+      'optimistic: two conflicting transactions -> conflict, not corruption',
+      () async {
+        engine.putDirect('acct', <int>[100]);
+        final Transaction a = manager.begin(
+          isolationLevel: IsolationLevel.optimistic,
+        );
+        final Transaction b = manager.begin(
+          isolationLevel: IsolationLevel.optimistic,
+        );
+        await a.get('acct');
+        await b.get('acct');
+        await a.put('acct', bytes('from-a'));
+        await b.put('acct', bytes('from-b'));
+
+        await manager.commit(a); // first committer wins
+        await expectLater(
+          manager.commit(b),
+          throwsA(isA<TransactionConflictException>()),
+        );
+        expect(
+          engine.getDirect('acct'),
+          bytes('from-a'),
+          reason: 'loser must not have clobbered the winner',
+        );
+        expectNoLocksHeld();
+      },
+    );
+
+    test(
+      'optimistic read-only dependency conflicts when a read key changes',
+      () async {
+        engine.putDirect('r', <int>[1]);
+        final Transaction a = manager.begin(
+          isolationLevel: IsolationLevel.optimistic,
+        );
+        await a.get('r');
+        await a.put('out', bytes('derived'));
+        // A pessimistic transaction commits a change to the read key.
+        final Transaction b = manager.begin();
+        await b.put('r', bytes('changed'));
+        await manager.commit(b);
+        await expectLater(
+          manager.commit(a),
+          throwsA(isA<TransactionConflictException>()),
+        );
+      },
+    );
+  });
+
+  group('deadlock and timeout', () {
+    test(
+      'two-transaction deadlock is detected quickly, one victim aborts',
+      () async {
+        final Transaction t1 = manager.begin();
+        final Transaction t2 = manager.begin();
+        await t1.put('A', bytes('t1'));
+        await t2.put('B', bytes('t2'));
+
+        final Stopwatch watch = Stopwatch()..start();
+        final Future<Object?> f1 = t1
+            .put('B', bytes('t1'))
+            .then<Object?>((_) => null, onError: (Object e) => e);
+        final Future<Object?> f2 = t2
+            .put('A', bytes('t2'))
+            .then<Object?>((_) => null, onError: (Object e) => e);
+        final List<Object?> outcomes = await Future.wait(<Future<Object?>>[
+          f1,
+          f2,
+        ]);
+        watch.stop();
+
+        final List<Object?> errors =
+            outcomes.where((Object? o) => o != null).toList();
+        expect(
+          errors,
+          hasLength(1),
+          reason: 'exactly one transaction is the deadlock victim',
+        );
+        expect(errors.single, isA<DeadlockException>());
+        expect(
+          watch.elapsed,
+          lessThan(const Duration(seconds: 3)),
+          reason: 'detection must not rely on the lock timeout',
+        );
+
+        // The survivor can commit; the victim was auto-aborted.
+        final Transaction survivor = outcomes[0] == null ? t1 : t2;
+        final Transaction victim = outcomes[0] == null ? t2 : t1;
+        expect(victim.state, TransactionState.aborted);
+        await manager.commit(survivor);
+        expectNoLocksHeld();
+      },
+    );
+
+    test(
+      'shared-to-exclusive upgrade deadlock between two readers resolves',
+      () async {
+        engine.putDirect('hot', <int>[0]);
+        final Transaction t1 = manager.begin(
+          isolationLevel: IsolationLevel.repeatableRead,
+        );
+        final Transaction t2 = manager.begin(
+          isolationLevel: IsolationLevel.repeatableRead,
+        );
+        await t1.get('hot');
+        await t2.get('hot');
+
+        final Future<Object?> u1 = t1
+            .put('hot', bytes('1'))
+            .then<Object?>((_) => null, onError: (Object e) => e);
+        final Future<Object?> u2 = t2
+            .put('hot', bytes('2'))
+            .then<Object?>((_) => null, onError: (Object e) => e);
+        final List<Object?> outcomes = await Future.wait(<Future<Object?>>[
+          u1,
+          u2,
+        ]).timeout(const Duration(seconds: 5));
+
+        expect(outcomes.whereType<DeadlockException>(), hasLength(1));
+        final Transaction survivor = outcomes[0] == null ? t1 : t2;
+        await manager.commit(survivor);
+        expectNoLocksHeld();
+      },
+    );
+
+    test(
+      'lock wait times out with TransactionTimeoutException as a backstop',
+      () async {
+        final TransactionManager fastManager = TransactionManager(
+          storageEngine: engine,
+          lockTimeout: const Duration(milliseconds: 200),
+        );
+        final Transaction holder = fastManager.begin();
+        await holder.put('locked', bytes('h'));
+        final Transaction waiter = fastManager.begin();
+        // No cycle here (holder is not waiting), so this is a pure timeout.
+        await expectLater(
+          waiter.put('locked', bytes('w')),
+          throwsA(isA<TransactionTimeoutException>()),
+        );
+        expect(waiter.state, TransactionState.aborted);
+        await fastManager.commit(holder);
+        expect(fastManager.lockManager.lockedKeyCount, 0);
+        expect(fastManager.lockManager.waiterCount, 0);
+        await fastManager.close();
+      },
+    );
+  });
+
+  group('lock release on every path', () {
+    test('locks fully released after commit', () async {
+      final Transaction tx = manager.begin(
+        isolationLevel: IsolationLevel.serializable,
       );
-
-      // Delete one
-      await transaction.delete('multi_2');
-
-      expect(transaction.writeSetSize, equals(3));
-      expect(transaction.operationCount, equals(5));
-
-      // Commit
-      await transactionManager.commitTransaction(transaction);
-
-      // Verify final state
-      final value1 = await storageEngine.get('multi_1'.codeUnits);
-      expect(String.fromCharCodes(value1!), equals('updated_1'));
-
-      final value2 = await storageEngine.get('multi_2'.codeUnits);
-      expect(value2, isNull);
-
-      final value3 = await storageEngine.get('multi_3'.codeUnits);
-      expect(String.fromCharCodes(value3!), equals('value_3'));
+      await tx.get('a');
+      await tx.put('b', bytes('1'));
+      await manager.commit(tx);
+      expectNoLocksHeld();
     });
 
-    test('should handle lock timeouts', () async {
-      final txn1 = transactionManager.beginTransaction();
-
-      // Transaction 1 acquires exclusive lock
-      await txn1.put('lock_key', Uint8List.fromList('locked'.codeUnits));
-
-      // Transaction 2 tries to acquire lock with timeout
-      final txn2 = transactionManager.beginTransaction();
-
-      // This should timeout since txn1 holds the lock
-      final lockFuture = txn2.put(
-        'lock_key',
-        Uint8List.fromList('waiting'.codeUnits),
+    test('locks fully released after abort', () async {
+      final Transaction tx = manager.begin(
+        isolationLevel: IsolationLevel.serializable,
       );
-
-      // Wait a bit and commit txn1
-      await Future.delayed(Duration(milliseconds: 100));
-      await transactionManager.commitTransaction(txn1);
-
-      // Now txn2 should be able to proceed
-      await lockFuture;
-      await transactionManager.commitTransaction(txn2);
-
-      // Verify final value
-      final value = await storageEngine.get('lock_key'.codeUnits);
-      expect(String.fromCharCodes(value!), equals('waiting'));
+      await tx.get('a');
+      await tx.put('b', bytes('1'));
+      await manager.abort(tx);
+      expectNoLocksHeld();
     });
+
+    test(
+      'locks fully released after a storage engine error during commit',
+      () async {
+        final Transaction tx = manager.begin();
+        await tx.put('k', bytes('v'));
+        engine.failNextWriteBatch = const CorruptionException('injected');
+        await expectLater(
+          manager.commit(tx),
+          throwsA(isA<CorruptionException>()),
+        );
+        expect(tx.state, TransactionState.aborted);
+        expectNoLocksHeld();
+        // A later transaction can lock and commit the same key.
+        final Transaction next = manager.begin();
+        await next.put('k', bytes('v2'));
+        await manager.commit(next);
+        expect(engine.getDirect('k'), bytes('v2'));
+      },
+    );
+
+    test('locks fully released after a lock timeout', () async {
+      final TransactionManager fastManager = TransactionManager(
+        storageEngine: engine,
+        lockTimeout: const Duration(milliseconds: 100),
+      );
+      final Transaction holder = fastManager.begin();
+      await holder.put('t', bytes('h'));
+      final Transaction waiter = fastManager.begin();
+      await waiter.put('other', bytes('w'));
+      await expectLater(
+        waiter.put('t', bytes('w')),
+        throwsA(isA<TransactionTimeoutException>()),
+      );
+      // The waiter's already-held lock on "other" was released by auto-abort.
+      final Transaction third = fastManager.begin();
+      await third.put('other', bytes('3'));
+      await fastManager.commit(third);
+      await fastManager.commit(holder);
+      expect(fastManager.lockManager.lockedKeyCount, 0);
+      expect(fastManager.lockManager.waiterCount, 0);
+      await fastManager.close();
+    });
+  });
+
+  group('runTransaction retry helper', () {
+    test('retries on conflict and succeeds within the bound', () async {
+      int attempts = 0;
+      final String result = await manager.runTransaction<String>(
+        (Transaction tx) async {
+          attempts++;
+          if (attempts < 3) {
+            throw const TransactionConflictException('synthetic conflict');
+          }
+          await tx.put('retry', bytes('done'));
+          return 'ok';
+        },
+        maxAttempts: 3,
+        initialBackoff: const Duration(milliseconds: 1),
+      );
+      expect(result, 'ok');
+      expect(attempts, 3);
+      expect(engine.getDirect('retry'), bytes('done'));
+      expectNoLocksHeld();
+    });
+
+    test('gives up after maxAttempts and rethrows the conflict', () async {
+      int attempts = 0;
+      await expectLater(
+        manager.runTransaction<void>(
+          (Transaction tx) async {
+            attempts++;
+            throw const TransactionConflictException('always conflicts');
+          },
+          maxAttempts: 3,
+          initialBackoff: const Duration(milliseconds: 1),
+        ),
+        throwsA(isA<TransactionConflictException>()),
+      );
+      expect(attempts, 3);
+    });
+
+    test('does NOT retry non-conflict errors', () async {
+      int attempts = 0;
+      await expectLater(
+        manager.runTransaction<void>((Transaction tx) async {
+          attempts++;
+          throw const SerializationException('bad payload');
+        }, maxAttempts: 5),
+        throwsA(isA<SerializationException>()),
+      );
+      expect(attempts, 1);
+      expectNoLocksHeld();
+    });
+
+    test('onCommit receives the commit result', () async {
+      CommitResult? seen;
+      await manager.runTransaction<void>((Transaction tx) async {
+        await tx.put('cb', bytes('v'));
+      }, onCommit: (CommitResult r) => seen = r);
+      expect(seen, isNotNull);
+      expect(seen!.operations.single.key, 'cb');
+    });
+  });
+
+  group('concurrency', () {
+    test('concurrent transactions on disjoint keys all commit', () async {
+      final List<Future<void>> futures = <Future<void>>[
+        for (int i = 0; i < 20; i++)
+          manager.runTransaction<void>((Transaction tx) async {
+            await tx.put('key-$i', bytes('value-$i'));
+            expect(await tx.get('key-$i'), bytes('value-$i'));
+          }),
+      ];
+      await Future.wait(futures);
+      for (int i = 0; i < 20; i++) {
+        expect(engine.getDirect('key-$i'), bytes('value-$i'));
+      }
+      expect(manager.stats.committedTransactions, 20);
+      expectNoLocksHeld();
+    });
+
+    test(
+      'keys containing underscores and colons never cross-notify locks',
+      () async {
+        // Historical bug: waiter keys were built as "<key>_<txId>" and matched
+        // by prefix, so "a" and "a_1" interfered. Verify independence.
+        final Transaction t1 = manager.begin();
+        final Transaction t2 = manager.begin();
+        await t1.put('a', bytes('1'));
+        await t2.put('a_1', bytes('2'));
+        await t2.put('users:1', bytes('3'));
+        await manager.commit(t1);
+        await manager.commit(t2);
+        expect(engine.getDirect('a'), bytes('1'));
+        expect(engine.getDirect('a_1'), bytes('2'));
+        expectNoLocksHeld();
+      },
+    );
   });
 }

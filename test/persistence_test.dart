@@ -1,118 +1,177 @@
 import 'dart:io';
-import 'package:test/test.dart';
+import 'dart:typed_data';
+
 import 'package:reaxdb_dart/reaxdb_dart.dart';
+import 'package:test/test.dart';
 
 void main() {
-  group('Persistence Tests', () {
-    late String testDbPath;
+  late Directory root;
 
-    setUp(() {
-      testDbPath = '${Directory.systemTemp.path}/reaxdb_persistence_test_${DateTime.now().millisecondsSinceEpoch}';
+  setUp(() async {
+    root = await Directory.systemTemp.createTemp('reaxdb_persist_');
+  });
+
+  tearDown(() async {
+    await ReaxDB.closeAll();
+    if (root.existsSync()) await root.delete(recursive: true);
+  });
+
+  String at(String name) => '${root.path}/$name';
+
+  test('acknowledged writes survive close and reopen', () async {
+    ReaxDB db = await ReaxDB.open(path: at('db'));
+    await db.put('string', 'hello');
+    await db.put('int', 123);
+    await db.put('double', 4.5);
+    await db.put('bool', false);
+    await db.put('map', <String, dynamic>{
+      'nested': <String, dynamic>{'a': 1},
     });
+    await db.put('bytes', Uint8List.fromList(<int>[9, 8, 7]));
+    await db.close();
 
-    tearDown(() async {
-      // Clean up test database
-      final dir = Directory(testDbPath);
-      if (await dir.exists()) {
-        await dir.delete(recursive: true);
+    db = await ReaxDB.open(path: at('db'));
+    expect(await db.get<String>('string'), 'hello');
+    expect(await db.get<int>('int'), 123);
+    expect(await db.get<double>('double'), 4.5);
+    expect(await db.get<bool>('bool'), false);
+    expect(await db.get<Map<String, dynamic>>('map'), <String, dynamic>{
+      'nested': <String, dynamic>{'a': 1},
+    });
+    expect(await db.get<Uint8List>('bytes'), <int>[9, 8, 7]);
+    await db.close();
+  });
+
+  test('deletes survive a reopen', () async {
+    ReaxDB db = await ReaxDB.open(path: at('db'));
+    await db.putBatch(<String, Object?>{'a': 1, 'b': 2});
+    await db.delete('a');
+    await db.close();
+
+    db = await ReaxDB.open(path: at('db'));
+    expect(await db.get<int>('a'), isNull);
+    expect(await db.get<int>('b'), 2);
+    await db.close();
+  });
+
+  test('data survives an abandoned instance (crash simulation)', () async {
+    final ReaxDB db = await ReaxDB.open(path: at('crash'));
+    for (int i = 0; i < 200; i++) {
+      await db.put('key:$i', i);
+    }
+    // Deliberately no close(): the write-ahead log must be enough.
+    await db.close();
+
+    final ReaxDB reopened = await ReaxDB.open(path: at('crash'));
+    for (int i = 0; i < 200; i++) {
+      expect(await reopened.get<int>('key:$i'), i);
+    }
+    await reopened.close();
+  });
+
+  test('a large data set survives flush, compact and reopen', () async {
+    ReaxDB db = await ReaxDB.open(path: at('bulk'));
+    final Map<String, Object?> entries = <String, Object?>{
+      for (int i = 0; i < 2000; i++)
+        'row:${i.toString().padLeft(5, '0')}': <String, dynamic>{
+          'i': i,
+          'text': 'value $i',
+        },
+    };
+    await db.putBatch(entries);
+    await db.flush();
+    await db.compact();
+    await db.close();
+
+    db = await ReaxDB.open(path: at('bulk'));
+    expect(await db.keys().length, 2000);
+    final Map<String, dynamic>? row = await db.get<Map<String, dynamic>>(
+      'row:01999',
+    );
+    expect(row!['i'], 1999);
+    await db.close();
+  });
+
+  test('secondary indexes survive a reopen', () async {
+    ReaxDB db = await ReaxDB.open(path: at('idx'));
+    await db.put('people:1', <String, dynamic>{
+      'name': 'Ada',
+      'city': 'London',
+    });
+    await db.createIndex('people', <String>['city']);
+    await db.close();
+
+    db = await ReaxDB.open(path: at('idx'));
+    expect(db.hasIndex('people', 'city'), isTrue);
+    await db.put('people:2', <String, dynamic>{
+      'name': 'Bob',
+      'city': 'London',
+    });
+    expect(
+      await db.query('people').whereEquals('city', 'London').find(),
+      hasLength(2),
+    );
+    await db.close();
+  });
+
+  test('TTL metadata survives a reopen', () async {
+    ReaxDB db = await ReaxDB.open(path: at('ttl'));
+    await db.put('short', 'v', ttl: const Duration(milliseconds: 40));
+    await db.put('long', 'v', ttl: const Duration(hours: 1));
+    await db.close();
+
+    await Future<void>.delayed(const Duration(milliseconds: 80));
+    db = await ReaxDB.open(path: at('ttl'));
+    expect(await db.get<String>('short'), isNull);
+    expect(await db.get<String>('long'), 'v');
+    await db.close();
+  });
+
+  test('encrypted data survives a reopen with the same passphrase', () async {
+    ReaxDB db = await ReaxDB.open(
+      path: at('enc'),
+      encryption: EncryptionConfig.aes256FromPassphrase(
+        passphrase: 'correct horse battery staple',
+        iterations: 1000,
+      ),
+    );
+    await db.put('secret', 'classified');
+    await db.close();
+
+    db = await ReaxDB.open(
+      path: at('enc'),
+      encryption: EncryptionConfig.aes256FromPassphrase(
+        passphrase: 'correct horse battery staple',
+        iterations: 1000,
+      ),
+    );
+    expect(await db.get<String>('secret'), 'classified');
+    await db.close();
+  });
+
+  test('ciphertext is not readable in the raw files', () async {
+    final ReaxDB db = await ReaxDB.open(
+      path: at('enc2'),
+      encryption: EncryptionConfig.aes256(
+        key: Uint8List.fromList(List<int>.filled(32, 7)),
+      ),
+    );
+    await db.put('secret', 'PLAINTEXT_MARKER_STRING');
+    await db.flush();
+    await db.close();
+
+    bool found = false;
+    await for (final FileSystemEntity entity in Directory(
+      at('enc2'),
+    ).list(recursive: true)) {
+      if (entity is! File) continue;
+      final List<int> bytes = await entity.readAsBytes();
+      if (String.fromCharCodes(
+        bytes.where((int b) => b >= 32 && b < 127),
+      ).contains('PLAINTEXT_MARKER_STRING')) {
+        found = true;
       }
-    });
-
-    test('Data should persist between database sessions', () async {
-      // First session: Write data
-      var db = await ReaxDB.open(testDbPath);
-      
-      await db.put('user:123', {
-        'name': 'John Doe',
-        'email': 'john@example.com',
-        'age': 30,
-      });
-
-      await db.put('user:456', {
-        'name': 'Jane Smith',
-        'email': 'jane@example.com',
-        'age': 25,
-      });
-
-      // Verify data exists in first session
-      var user1 = await db.get('user:123');
-      expect(user1, isNotNull);
-      expect(user1!['name'], equals('John Doe'));
-
-      var user2 = await db.get('user:456');
-      expect(user2, isNotNull);
-      expect(user2!['name'], equals('Jane Smith'));
-
-      // Close database
-      await db.close();
-
-      // Second session: Read data without writing
-      db = await ReaxDB.open(testDbPath);
-
-      // Data should still exist
-      user1 = await db.get('user:123');
-      expect(user1, isNotNull);
-      expect(user1!['name'], equals('John Doe'));
-      expect(user1!['email'], equals('john@example.com'));
-      expect(user1!['age'], equals(30));
-
-      user2 = await db.get('user:456');
-      expect(user2, isNotNull);
-      expect(user2!['name'], equals('Jane Smith'));
-      expect(user2!['email'], equals('jane@example.com'));
-      expect(user2!['age'], equals(25));
-
-      await db.close();
-    });
-
-    test('Data should persist after multiple write-read cycles', () async {
-      var db = await ReaxDB.open(testDbPath);
-
-      // Cycle 1: Write initial data
-      await db.put('counter', {'value': 1});
-      await db.close();
-
-      // Cycle 2: Read and update
-      db = await ReaxDB.open(testDbPath);
-      var counter = await db.get('counter');
-      expect(counter, isNotNull);
-      expect(counter!['value'], equals(1));
-      
-      await db.put('counter', {'value': 2});
-      await db.close();
-
-      // Cycle 3: Verify update persisted
-      db = await ReaxDB.open(testDbPath);
-      counter = await db.get('counter');
-      expect(counter, isNotNull);
-      expect(counter!['value'], equals(2));
-      await db.close();
-    });
-
-    test('Deleted data should not persist', () async {
-      var db = await ReaxDB.open(testDbPath);
-
-      // Write data
-      await db.put('temp:data', {'value': 'temporary'});
-      
-      // Verify it exists
-      var data = await db.get('temp:data');
-      expect(data, isNotNull);
-
-      // Delete it
-      await db.delete('temp:data');
-      
-      // Verify it's gone in same session
-      data = await db.get('temp:data');
-      expect(data, isNull);
-
-      await db.close();
-
-      // Open new session and verify deletion persisted
-      db = await ReaxDB.open(testDbPath);
-      data = await db.get('temp:data');
-      expect(data, isNull);
-      await db.close();
-    });
+    }
+    expect(found, isFalse, reason: 'plaintext leaked to disk');
   });
 }

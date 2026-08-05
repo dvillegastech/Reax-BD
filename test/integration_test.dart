@@ -1,288 +1,354 @@
 import 'dart:io';
-import 'package:test/test.dart';
+import 'dart:typed_data';
+
 import 'package:reaxdb_dart/reaxdb_dart.dart';
+import 'package:test/test.dart';
+
+class Product {
+  Product({required this.sku, required this.name, required this.price});
+
+  factory Product.fromJson(Map<String, dynamic> json) => Product(
+    sku: json['sku'] as String,
+    name: json['name'] as String,
+    price: (json['price'] as num).toDouble(),
+  );
+
+  final String sku;
+  final String name;
+  final double price;
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+    'sku': sku,
+    'name': name,
+    'price': price,
+  };
+}
 
 void main() {
-  group('ReaxDB Integration Tests', () {
-    late String testDbPath;
-    late ReaxDB db;
+  late Directory root;
 
-    setUp(() async {
-      testDbPath = '${Directory.systemTemp.path}/reaxdb_integration_${DateTime.now().millisecondsSinceEpoch}';
-      db = await ReaxDB.open(testDbPath);
-    });
+  setUp(() async {
+    root = await Directory.systemTemp.createTemp('reaxdb_integration_');
+  });
 
-    tearDown(() async {
-      await db.close();
-      final dir = Directory(testDbPath);
-      if (await dir.exists()) {
-        await dir.delete(recursive: true);
-      }
-    });
+  tearDown(() async {
+    await ReaxDB.closeAll();
+    if (root.existsSync()) await root.delete(recursive: true);
+  });
 
-    test('Complete workflow: CRUD operations with persistence', () async {
-      // 1. Create multiple records
-      await db.put('user:1', {
-        'name': 'Alice',
-        'email': 'alice@example.com',
-        'age': 30,
+  String at(String name) => '${root.path}/$name';
+
+  group('backup and restore', () {
+    test('exportTo and importFrom round-trip data and indexes', () async {
+      final ReaxDB source = await ReaxDB.open(path: at('source'));
+      await source.putBatch(<String, Object?>{
+        'people:1': <String, dynamic>{'name': 'Ada', 'city': 'London'},
+        'people:2': <String, dynamic>{'name': 'Bob', 'city': 'Oslo'},
+        'config': <String, dynamic>{'theme': 'dark'},
+        'counter': 41,
       });
+      await source.createIndex('people', <String>['city']);
+      final String archive = at('backup.rxdb');
+      final int exported = await source.exportTo(archive);
+      expect(exported, 4);
+      await source.close();
 
-      await db.put('user:2', {
-        'name': 'Bob',
-        'email': 'bob@example.com',
-        'age': 25,
-      });
-
-      await db.put('product:1', {
-        'name': 'Laptop',
-        'price': 999.99,
-        'inStock': true,
-      });
-
-      // 2. Verify all records exist
-      var user1 = await db.get('user:1');
-      var user2 = await db.get('user:2');
-      var product1 = await db.get('product:1');
-
-      expect(user1!['name'], equals('Alice'));
-      expect(user2!['name'], equals('Bob'));
-      expect(product1!['name'], equals('Laptop'));
-
-      // 3. Update a record
-      await db.put('user:1', {
-        'name': 'Alice Smith',
-        'email': 'alice.smith@example.com',
-        'age': 31,
-      });
-
-      user1 = await db.get('user:1');
-      expect(user1!['name'], equals('Alice Smith'));
-      expect(user1['age'], equals(31));
-
-      // 4. Delete a record
-      await db.delete('user:2');
-      user2 = await db.get('user:2');
-      expect(user2, isNull);
-
-      // 5. Close and reopen to test persistence
-      await db.close();
-      db = await ReaxDB.open(testDbPath);
-
-      // 6. Verify data persisted correctly
-      user1 = await db.get('user:1');
-      user2 = await db.get('user:2');
-      product1 = await db.get('product:1');
-
-      expect(user1!['name'], equals('Alice Smith'));
-      expect(user1['email'], equals('alice.smith@example.com'));
-      expect(user1['age'], equals(31));
-      expect(user2, isNull); // Should still be deleted
-      expect(product1!['name'], equals('Laptop'));
+      final ReaxDB restored = await ReaxDB.importFrom(
+        archivePath: archive,
+        path: at('restored'),
+      );
+      expect(await restored.get<int>('counter'), 41);
+      expect(
+        (await restored.get<Map<String, dynamic>>('config'))!['theme'],
+        'dark',
+      );
+      expect(restored.hasIndex('people', 'city'), isTrue);
+      expect(
+        await restored.query('people').whereEquals('city', 'Oslo').find(),
+        hasLength(1),
+      );
+      await restored.close();
     });
 
-    test('Handles empty values correctly', () async {
-      // Test that empty values are stored and retrieved correctly
-      await db.put('empty:1', {'data': ''});
-      await db.put('empty:2', {'list': []});
-      await db.put('empty:3', {});
+    test(
+      'a backup can be restored into a differently encrypted database',
+      () async {
+        final ReaxDB source = await ReaxDB.open(path: at('plain'));
+        await source.put('secret', 'value');
+        final String archive = at('plain.rxdb');
+        await source.exportTo(archive);
+        await source.close();
 
-      var empty1 = await db.get('empty:1');
-      var empty2 = await db.get('empty:2');
-      var empty3 = await db.get('empty:3');
+        final ReaxDB encrypted = await ReaxDB.importFrom(
+          archivePath: archive,
+          path: at('encrypted'),
+          encryption: EncryptionConfig.aes256(
+            key: Uint8List.fromList(List<int>.filled(32, 3)),
+          ),
+        );
+        expect(await encrypted.get<String>('secret'), 'value');
+        expect(encrypted.encryptionInfo['type'], 'aes256');
+        await encrypted.close();
+      },
+    );
 
-      expect(empty1!['data'], equals(''));
-      expect(empty2!['list'], isEmpty);
-      expect(empty3, isNotNull);
-      expect(empty3!.isEmpty, isTrue);
+    test('TTL metadata survives export and import', () async {
+      final ReaxDB source = await ReaxDB.open(path: at('ttl'));
+      await source.put('temp', 'v', ttl: const Duration(hours: 1));
+      final String archive = at('ttl.rxdb');
+      await source.exportTo(archive);
+      await source.close();
 
-      // Close and reopen
-      await db.close();
-      db = await ReaxDB.open(testDbPath);
-
-      // Verify empty values persisted
-      empty1 = await db.get('empty:1');
-      empty2 = await db.get('empty:2');
-      empty3 = await db.get('empty:3');
-
-      expect(empty1!['data'], equals(''));
-      expect(empty2!['list'], isEmpty);
-      expect(empty3, isNotNull);
+      final ReaxDB restored = await ReaxDB.importFrom(
+        archivePath: archive,
+        path: at('ttl-restored'),
+      );
+      final List<ReaxEntry<String>> entries =
+          await restored.scan<String>().toList();
+      expect(entries.single.expiresAt, isNotNull);
+      await restored.close();
     });
 
-    test('Handles batch operations', () async {
-      // Create multiple records in batch
-      final records = <String, Map<String, dynamic>>{};
-      for (int i = 0; i < 100; i++) {
-        records['item:$i'] = {
-          'id': i,
-          'value': 'Item $i',
-          'timestamp': DateTime.now().toIso8601String(),
-        };
-      }
+    test('importing into a non-empty directory needs overwrite', () async {
+      final ReaxDB source = await ReaxDB.open(path: at('src2'));
+      await source.put('a', 1);
+      final String archive = at('src2.rxdb');
+      await source.exportTo(archive);
+      await source.close();
 
-      // Write all records
-      for (final entry in records.entries) {
-        await db.put(entry.key, entry.value);
-      }
+      final ReaxDB occupied = await ReaxDB.open(path: at('target'));
+      await occupied.put('b', 2);
+      await occupied.close();
 
-      // Verify all records exist
-      for (int i = 0; i < 100; i++) {
-        final item = await db.get('item:$i');
-        expect(item, isNotNull);
-        expect(item!['id'], equals(i));
-        expect(item['value'], equals('Item $i'));
-      }
+      expect(
+        () => ReaxDB.importFrom(archivePath: archive, path: at('target')),
+        throwsA(isA<DatabaseLockedException>()),
+      );
 
-      // Delete even-numbered items
-      for (int i = 0; i < 100; i += 2) {
-        await db.delete('item:$i');
-      }
-
-      // Close and reopen
-      await db.close();
-      db = await ReaxDB.open(testDbPath);
-
-      // Verify deletions persisted
-      for (int i = 0; i < 100; i++) {
-        final item = await db.get('item:$i');
-        if (i % 2 == 0) {
-          expect(item, isNull);
-        } else {
-          expect(item, isNotNull);
-          expect(item!['id'], equals(i));
-        }
-      }
+      final ReaxDB replaced = await ReaxDB.importFrom(
+        archivePath: archive,
+        path: at('target'),
+        overwrite: true,
+      );
+      expect(await replaced.get<int>('a'), 1);
+      expect(await replaced.get<int>('b'), isNull);
+      await replaced.close();
     });
+  });
 
-    test('Handles special characters and unicode', () async {
-      // Test various special characters and unicode
-      final testData = {
-        'special:chars': {'data': 'Hello@World#2024!'},
-        'unicode:emoji': {'emoji': '🚀🔥💻', 'text': 'Rocket Fire Computer'},
-        'unicode:languages': {
-          'english': 'Hello',
-          'spanish': 'Hola',
-          'chinese': '你好',
-          'arabic': 'مرحبا',
-          'japanese': 'こんにちは',
+  group('schema migrations', () {
+    test('onUpgrade runs once and the version is recorded', () async {
+      ReaxDB db = await ReaxDB.open(path: at('schema'), schemaVersion: 1);
+      await db.put('user:1', <String, dynamic>{'name': 'Ada'});
+      await db.close();
+
+      final List<String> calls = <String>[];
+      db = await ReaxDB.open(
+        path: at('schema'),
+        schemaVersion: 2,
+        onUpgrade: (int from, int to, ReaxDB target) async {
+          calls.add('$from->$to');
+          final Map<String, dynamic>? user = await target
+              .get<Map<String, dynamic>>('user:1');
+          await target.put('user:1', <String, dynamic>{
+            ...user!,
+            'migrated': true,
+          });
         },
-        'path:like': {'path': '/usr/local/bin/app'},
-        'key:with:colons': {'type': 'namespaced'},
-      };
-
-      // Write all test data
-      for (final entry in testData.entries) {
-        await db.put(entry.key, entry.value);
-      }
-
-      // Verify all data
-      for (final entry in testData.entries) {
-        final retrieved = await db.get(entry.key);
-        expect(retrieved, equals(entry.value));
-      }
-
-      // Close and reopen
+      );
+      expect(calls, <String>['1->2']);
+      expect(db.schemaVersion, 2);
+      expect(
+        (await db.get<Map<String, dynamic>>('user:1'))!['migrated'],
+        isTrue,
+      );
       await db.close();
-      db = await ReaxDB.open(testDbPath);
 
-      // Verify persistence
-      for (final entry in testData.entries) {
-        final retrieved = await db.get(entry.key);
-        expect(retrieved, equals(entry.value));
-      }
-    });
-
-    test('Handles complex nested structures', () async {
-      final complexData = {
-        'user': {
-          'id': 'u123',
-          'profile': {
-            'name': 'John Doe',
-            'contacts': {
-              'emails': ['john@example.com', 'john.doe@work.com'],
-              'phones': ['+1234567890', '+0987654321'],
-            },
-            'preferences': {
-              'theme': 'dark',
-              'notifications': {
-                'email': true,
-                'push': false,
-                'sms': true,
-              },
-            },
-          },
-          'metadata': {
-            'created': DateTime.now().toIso8601String(),
-            'lastLogin': DateTime.now().toIso8601String(),
-            'loginCount': 42,
-          },
+      // Reopening at the same version does not re-run the migration.
+      db = await ReaxDB.open(
+        path: at('schema'),
+        schemaVersion: 2,
+        onUpgrade: (int from, int to, ReaxDB target) async {
+          calls.add('$from->$to');
         },
-      };
-
-      await db.put('complex:user', complexData);
-
-      // Verify complex structure
-      var retrieved = await db.get('complex:user');
-      expect(retrieved, isNotNull);
-      expect(retrieved!['user']['profile']['name'], equals('John Doe'));
-      expect(retrieved['user']['profile']['contacts']['emails'].length, equals(2));
-      expect(retrieved['user']['metadata']['loginCount'], equals(42));
-
-      // Update nested field
-      (complexData['user'] as Map<String, dynamic>)['metadata']['loginCount'] = 43;
-      await db.put('complex:user', complexData);
-
-      // Close and reopen
+      );
+      expect(calls, <String>['1->2']);
       await db.close();
-      db = await ReaxDB.open(testDbPath);
+    });
+  });
 
-      // Verify persistence of complex structure
-      retrieved = await db.get('complex:user');
-      expect(retrieved!['user']['metadata']['loginCount'], equals(43));
+  group('instance registry and locking', () {
+    test('a second open in the same isolate is rejected', () async {
+      final ReaxDB db = await ReaxDB.open(path: at('locked'));
+      expect(
+        () => ReaxDB.open(path: at('locked')),
+        throwsA(
+          isA<DatabaseLockedException>().having(
+            (DatabaseLockedException e) => e.path,
+            'path',
+            isNotNull,
+          ),
+        ),
+      );
+      await db.close();
     });
 
-    test('Database statistics and info', () async {
-      // Add some data
-      for (int i = 0; i < 50; i++) {
-        await db.put('stat:$i', {'value': i, 'data': 'x' * 100});
+    test('another process cannot open a locked database', () async {
+      final ReaxDB db = await ReaxDB.open(path: at('cross'));
+      final String script = at('probe.dart');
+      await File(script).writeAsString('''
+import 'dart:io';
+Future<void> main() async {
+  final RandomAccessFile handle =
+      await File('${at('cross')}/LOCK').open(mode: FileMode.write);
+  try {
+    await handle.lock(FileLock.exclusive);
+    stdout.write('acquired');
+  } on FileSystemException {
+    stdout.write('locked');
+  }
+  await handle.close();
+}
+''');
+      final ProcessResult result = await Process.run(
+        Platform.resolvedExecutable,
+        <String>['run', script],
+      );
+      expect(result.stdout, contains('locked'));
+      await db.close();
+    });
+
+    test('the lock is released on close and the path reopens', () async {
+      ReaxDB db = await ReaxDB.open(path: at('reopen'));
+      await db.put('a', 1);
+      await db.close();
+      db = await ReaxDB.open(path: at('reopen'));
+      expect(await db.get<int>('a'), 1);
+      await db.close();
+    });
+  });
+
+  group('sync modes', () {
+    test('a database can be opened in each sync mode', () async {
+      for (final SyncMode mode in SyncMode.values) {
+        final ReaxDB db = await ReaxDB.open(
+          path: at('sync-${mode.name}'),
+          syncMode: mode,
+        );
+        expect(db.syncMode, mode);
+        await db.put('a', 1);
+        await db.close();
+
+        final ReaxDB reopened = await ReaxDB.open(
+          path: at('sync-${mode.name}'),
+          syncMode: mode,
+        );
+        expect(await reopened.get<int>('a'), 1);
+        await reopened.close();
       }
-
-      // Get database info
-      final info = await db.getDatabaseInfo();
-      expect(info.name, isNotNull);
-      expect(info.path, isNotNull);
-      
-      // Note: getStatistics might return null in some cases
-      // so we skip that part of the test for now
     });
 
-    test('Error handling and edge cases', () async {
-      // Test empty key handling (should work without throwing)
-      await db.put('', {'empty': 'key'});
-      final emptyKey = await db.get('');
-      expect(emptyKey!['empty'], equals('key'));
-      
-      // Test getting non-existent key
-      final nonExistent = await db.get('does:not:exist');
-      expect(nonExistent, isNull);
+    test('a per-write override survives a reopen', () async {
+      ReaxDB db = await ReaxDB.open(
+        path: at('override'),
+        syncMode: SyncMode.none,
+      );
+      await db.put('durable', 'value', sync: SyncMode.full);
+      await db.close();
 
-      // Test deleting non-existent key (should not throw)
-      await db.delete('does:not:exist:either');
+      db = await ReaxDB.open(path: at('override'), syncMode: SyncMode.none);
+      expect(await db.get<String>('durable'), 'value');
+      await db.close();
+    });
+  });
 
-      // Test very long key
-      final longKey = 'x' * 1000;
-      await db.put(longKey, {'data': 'long key test'});
-      final longKeyData = await db.get(longKey);
-      expect(longKeyData!['data'], equals('long key test'));
+  group('end-to-end workflow', () {
+    test(
+      'typed collections, indexes, queries and streams work together',
+      () async {
+        final ReaxDB db = await ReaxDB.open(path: at('shop'));
+        final ReaxCollection<Product> products = db.collection<Product>(
+          'products',
+          fromJson: Product.fromJson,
+          toJson: (Product p) => p.toJson(),
+        );
+        await products.createIndex(<String>['price']);
 
-      // Test large value
-      final largeValue = {
-        'data': List.generate(1000, (i) => 'Item $i'),
-      };
-      await db.put('large:value', largeValue);
-      final retrievedLarge = await db.get('large:value');
-      expect(retrievedLarge!['data'].length, equals(1000));
+        final List<CollectionChange<Product>> changes =
+            <CollectionChange<Product>>[];
+        final subscription = products.watch().listen(changes.add);
+        await Future<void>.delayed(Duration.zero);
+
+        await products.putAll(<String, Product>{
+          'a': Product(sku: 'a', name: 'Anvil', price: 30),
+          'b': Product(sku: 'b', name: 'Bolt', price: 5),
+          'c': Product(sku: 'c', name: 'Cog', price: 12),
+        });
+
+        final List<Product> cheap = await products.find(
+          (QueryBuilder q) => q.whereLessThan('price', 20).orderBy('price'),
+        );
+        expect(cheap.map((Product p) => p.sku), <String>['b', 'c']);
+
+        final Map<String, AggregationResult> totals =
+            await db
+                    .query('products')
+                    .aggregate(
+                      (AggregationBuilder b) =>
+                          b
+                            ..sum('price')
+                            ..count(),
+                    )
+                    .executeAggregation()
+                as Map<String, AggregationResult>;
+        expect(totals['sum_price']!.value, 47);
+        expect(totals['count']!.value, 3);
+
+        await Future<void>.delayed(Duration.zero);
+        await subscription.cancel();
+        expect(changes, hasLength(3));
+
+        await db.transaction<void>((ReaxTransaction tx) async {
+          await tx.put('products:d', <String, dynamic>{
+            'sku': 'd',
+            'name': 'Drum',
+            'price': 8.0,
+          });
+        });
+        expect(await products.count(), 4);
+
+        final DatabaseInfo info = await db.info();
+        expect(info.entryCount, 4);
+        expect(info.indexCount, 1);
+        await db.close();
+      },
+    );
+
+    test('a heavier mixed workload stays consistent', () async {
+      final ReaxDB db = await ReaxDB.open(path: at('mixed'));
+      await db.createIndex('doc', <String>['bucket']);
+
+      for (int i = 0; i < 300; i++) {
+        await db.put('doc:${i.toString().padLeft(4, '0')}', <String, dynamic>{
+          'i': i,
+          'bucket': i % 5,
+        });
+      }
+      await db.flush();
+
+      for (int i = 0; i < 300; i += 3) {
+        await db.delete('doc:${i.toString().padLeft(4, '0')}');
+      }
+      await db.compact();
+
+      expect(await db.query('doc').count(), 200);
+      final List<Map<String, dynamic>> bucketZero =
+          await db.query('doc').whereEquals('bucket', 0).find();
+      for (final Map<String, dynamic> doc in bucketZero) {
+        expect((doc['i'] as int) % 5, 0);
+        expect((doc['i'] as int) % 3, isNot(0));
+      }
+      await db.close();
     });
   });
 }

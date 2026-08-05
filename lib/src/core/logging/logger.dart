@@ -1,65 +1,101 @@
 import 'log_level.dart';
 import 'log_output.dart';
 
-/// ReaxDB Logger with configurable outputs and levels
-class ReaxLogger {
-  static ReaxLogger? _instance;
-  static ReaxLogger get instance => _instance ??= ReaxLogger._();
+/// ReaxDB logger with per-instance configuration.
+///
+/// Each database instance owns its own [ReaxLogger], so two databases in the
+/// same process can log at different levels to different outputs. A shared
+/// process-wide default remains available as [ReaxLogger.root] (also exposed
+/// as the top-level [logger]) for code that is not tied to one database.
+///
+/// ## No-PII policy
+///
+/// ReaxDB never logs database key contents, value contents, encryption keys,
+/// passphrases, or derived key material — at any level, including debug. Use
+/// the helpers in `redaction.dart` (`Redaction.key`, `Redaction.value`) when
+/// a message needs to reference a key or value.
+///
+/// ## Ownership
+///
+/// The outputs attached to a logger are owned by it: [close] closes them
+/// (for example flushing and closing a `FileLogOutput` sink). A database
+/// closes its own logger when the database is closed. After [close], further
+/// log calls are silently dropped.
+final class ReaxLogger {
+  /// Creates a logger with its own level and outputs.
+  ///
+  /// If [outputs] is omitted, a [ConsoleLogOutput] is attached when running
+  /// in a non-product build, and nothing otherwise. [name], when provided,
+  /// is prefixed to every message (useful to distinguish databases).
+  ReaxLogger({
+    LogLevel level = LogLevel.info,
+    List<LogOutput>? outputs,
+    bool enabled = true,
+    this.name,
+  }) : _level = level,
+       _enabled = enabled,
+       _outputs =
+           outputs != null
+               ? List<LogOutput>.of(outputs)
+               : <LogOutput>[
+                 if (const bool.fromEnvironment('dart.vm.product') == false)
+                   ConsoleLogOutput(),
+               ];
 
-  LogLevel _level = LogLevel.info;
-  final List<LogOutput> _outputs = [];
-  bool _enabled = true;
+  /// Process-wide default logger.
+  static final ReaxLogger root = ReaxLogger();
 
-  ReaxLogger._() {
-    // Default to console output in debug mode
-    if (const bool.fromEnvironment('dart.vm.product') == false) {
-      _outputs.add(ConsoleLogOutput());
-    }
-  }
+  /// Optional name prefixed to every message.
+  final String? name;
 
-  /// Configure the logger
+  LogLevel _level;
+  bool _enabled;
+  bool _closed = false;
+  final List<LogOutput> _outputs;
+
+  /// The current level threshold.
+  LogLevel get level => _level;
+
+  /// Whether logging is enabled.
+  bool get isEnabled => _enabled && !_closed;
+
+  /// Reconfigures this logger instance.
+  ///
+  /// When [outputs] is provided the previous outputs are replaced but NOT
+  /// closed — close them yourself if this logger owned them exclusively.
   void configure({LogLevel? level, List<LogOutput>? outputs, bool? enabled}) {
     if (level != null) _level = level;
     if (outputs != null) {
-      _outputs.clear();
-      _outputs.addAll(outputs);
+      _outputs
+        ..clear()
+        ..addAll(outputs);
     }
     if (enabled != null) _enabled = enabled;
   }
 
-  /// Add a log output
-  void addOutput(LogOutput output) {
-    _outputs.add(output);
-  }
+  /// Adds a log output. The logger takes ownership (see [close]).
+  void addOutput(LogOutput output) => _outputs.add(output);
 
-  /// Remove a log output
-  void removeOutput(LogOutput output) {
-    _outputs.remove(output);
-  }
+  /// Removes a log output without closing it.
+  void removeOutput(LogOutput output) => _outputs.remove(output);
 
-  /// Clear all outputs
-  void clearOutputs() {
-    _outputs.clear();
-  }
+  /// Removes all outputs without closing them.
+  void clearOutputs() => _outputs.clear();
 
-  /// Set log level
-  void setLevel(LogLevel level) {
-    _level = level;
-  }
+  /// Sets the level threshold.
+  void setLevel(LogLevel level) => _level = level;
 
-  /// Enable/disable logging
-  void setEnabled(bool enabled) {
-    _enabled = enabled;
-  }
+  /// Enables or disables logging.
+  void setEnabled(bool enabled) => _enabled = enabled;
 
-  /// Log an error message
+  /// Logs an error message.
   Future<void> error(
     String message, {
     Object? error,
     StackTrace? stackTrace,
     Map<String, dynamic>? metadata,
-  }) async {
-    await _log(
+  }) {
+    return _log(
       LogLevel.error,
       message,
       error: error,
@@ -68,22 +104,21 @@ class ReaxLogger {
     );
   }
 
-  /// Log a warning message
-  Future<void> warning(String message, {Map<String, dynamic>? metadata}) async {
-    await _log(LogLevel.warning, message, metadata: metadata);
+  /// Logs a warning message.
+  Future<void> warning(String message, {Map<String, dynamic>? metadata}) {
+    return _log(LogLevel.warning, message, metadata: metadata);
   }
 
-  /// Log an info message
-  Future<void> info(String message, {Map<String, dynamic>? metadata}) async {
-    await _log(LogLevel.info, message, metadata: metadata);
+  /// Logs an info message.
+  Future<void> info(String message, {Map<String, dynamic>? metadata}) {
+    return _log(LogLevel.info, message, metadata: metadata);
   }
 
-  /// Log a debug message
-  Future<void> debug(String message, {Map<String, dynamic>? metadata}) async {
-    await _log(LogLevel.debug, message, metadata: metadata);
+  /// Logs a debug message.
+  Future<void> debug(String message, {Map<String, dynamic>? metadata}) {
+    return _log(LogLevel.debug, message, metadata: metadata);
   }
 
-  /// Internal log method
   Future<void> _log(
     LogLevel level,
     String message, {
@@ -91,36 +126,46 @@ class ReaxLogger {
     StackTrace? stackTrace,
     Map<String, dynamic>? metadata,
   }) async {
-    if (!_enabled || !_level.shouldLog(level)) {
+    if (_closed || !_enabled || !_level.shouldLog(level)) {
       return;
     }
-
-    final fullMetadata = <String, dynamic>{
+    final String fullMessage = name == null ? message : '[$name] $message';
+    final Map<String, dynamic> fullMetadata = <String, dynamic>{
       if (metadata != null) ...metadata,
       if (error != null) 'error': error.toString(),
       if (stackTrace != null) 'stackTrace': stackTrace.toString(),
     };
-
-    for (final output in _outputs) {
+    for (final LogOutput output in _outputs) {
       try {
         await output.write(
           level,
-          message,
+          fullMessage,
           metadata: fullMetadata.isEmpty ? null : fullMetadata,
         );
-      } catch (e) {
-        // Silently ignore output errors to prevent cascading failures
+      } catch (_) {
+        // A failing output must not take down the database.
       }
     }
   }
 
-  /// Close all outputs
+  /// Closes this logger and every attached output.
+  ///
+  /// Idempotent. Subsequent log calls are dropped.
   Future<void> close() async {
-    for (final output in _outputs) {
-      await output.close();
+    if (_closed) {
+      return;
     }
+    _closed = true;
+    for (final LogOutput output in _outputs) {
+      try {
+        await output.close();
+      } catch (_) {
+        // Best effort: closing one output must not skip the others.
+      }
+    }
+    _outputs.clear();
   }
 }
 
-/// Global logger instance
-final logger = ReaxLogger.instance;
+/// Process-wide default logger instance (same object as [ReaxLogger.root]).
+final ReaxLogger logger = ReaxLogger.root;

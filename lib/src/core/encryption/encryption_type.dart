@@ -1,63 +1,83 @@
-/// Encryption types available in ReaxDB
+/// Encryption algorithms supported by ReaxDB.
+///
+/// The effective algorithm is always reported honestly by
+/// `EncryptionEngine.getMetadata()`; ReaxDB never silently downgrades from a
+/// requested algorithm to a weaker one. If a platform cannot run the requested
+/// cipher, engine construction throws an `EncryptionException` instead.
 enum EncryptionType {
-  /// No encryption - fastest performance
+  /// No encryption. Values are stored as plaintext.
   none,
 
-  /// XOR encryption - fast but not cryptographically secure
-  /// Best for: Performance-critical apps with basic obfuscation needs
-  /// Security: Low - vulnerable to frequency analysis
-  xor,
+  /// Repeating-key XOR obfuscation.
+  ///
+  /// **This is NOT encryption and provides NO confidentiality against any
+  /// motivated attacker.** It only prevents values from being casually
+  /// readable in a hex dump. It is trivially broken with known plaintext or
+  /// frequency analysis and has no integrity protection. Use
+  /// [EncryptionType.aes256] for any data that actually needs protection.
+  obfuscation,
 
-  /// AES-256-GCM encryption - cryptographically secure
-  /// Best for: Production apps handling sensitive data
-  /// Security: High - industry standard encryption
-  aes256,
+  /// AES-256-GCM authenticated encryption.
+  ///
+  /// Industry-standard confidentiality and integrity. Every value is
+  /// encrypted with a fresh random 96-bit IV and carries a 128-bit
+  /// authentication tag; tampering is detected on decrypt.
+  aes256;
+
+  /// Compatibility alias for the ReaxDB 1.x name of [obfuscation].
+  ///
+  /// The value is identical, only the name changed: XOR was never encryption
+  /// and the 1.x name suggested otherwise. Note that a `switch` over
+  /// [EncryptionType] must match [obfuscation]; `case EncryptionType.xor`
+  /// is not a valid pattern because this is a constant, not an enum value.
+  @Deprecated('Renamed to EncryptionType.obfuscation. Removed in 3.0.')
+  static const EncryptionType xor = EncryptionType.obfuscation;
 }
 
-/// Extension to provide human-readable descriptions
+/// Human-readable descriptions of each [EncryptionType].
 extension EncryptionTypeExtension on EncryptionType {
-  /// Human-readable name
+  /// Human-readable name.
   String get displayName {
     switch (this) {
       case EncryptionType.none:
         return 'No Encryption';
-      case EncryptionType.xor:
-        return 'XOR (Fast)';
+      case EncryptionType.obfuscation:
+        return 'XOR Obfuscation (NOT encryption)';
       case EncryptionType.aes256:
-        return 'AES-256 (Secure)';
+        return 'AES-256-GCM';
     }
   }
 
-  /// Security level description
+  /// Honest security level description.
   String get securityLevel {
     switch (this) {
       case EncryptionType.none:
-        return 'None';
-      case EncryptionType.xor:
-        return 'Low - Basic obfuscation only';
+        return 'None - plaintext';
+      case EncryptionType.obfuscation:
+        return 'None - obfuscation only, trivially reversible, no integrity';
       case EncryptionType.aes256:
-        return 'High - Cryptographically secure';
+        return 'High - authenticated encryption (AES-256-GCM)';
     }
   }
 
-  /// Performance impact description
+  /// Rough performance impact description.
   String get performanceImpact {
     switch (this) {
       case EncryptionType.none:
         return 'No impact';
-      case EncryptionType.xor:
-        return 'Minimal (~5% overhead)';
+      case EncryptionType.obfuscation:
+        return 'Minimal';
       case EncryptionType.aes256:
-        return 'Moderate (~15-25% overhead)';
+        return 'Moderate';
     }
   }
 
-  /// Whether this encryption type requires a key
+  /// Whether this type requires key material.
   bool get requiresKey {
     switch (this) {
       case EncryptionType.none:
         return false;
-      case EncryptionType.xor:
+      case EncryptionType.obfuscation:
       case EncryptionType.aes256:
         return true;
     }

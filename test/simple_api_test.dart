@@ -1,389 +1,184 @@
-import 'package:test/test.dart';
-import 'package:reaxdb_dart/reaxdb_dart.dart';
 import 'dart:io';
-import 'dart:convert';
+
+import 'package:reaxdb_dart/reaxdb_dart.dart';
+import 'package:test/test.dart';
 
 void main() {
-  group('SimpleReaxDB API Tests', () {
-    late SimpleReaxDB db;
-    final testDir = Directory('test_db_simple');
-    
-    setUp(() async {
-      // Clean up any existing test database
-      if (testDir.existsSync()) {
-        testDir.deleteSync(recursive: true);
-      }
-      
-      // Create new test database
-      db = await ReaxDB.simple('test_simple', path: testDir.path);
+  late Directory root;
+  late SimpleReaxDB db;
+
+  setUp(() async {
+    root = await Directory.systemTemp.createTemp('reaxdb_simple_');
+    db = await ReaxDB.simple('myapp', path: '${root.path}/myapp');
+  });
+
+  tearDown(() async {
+    await ReaxDB.closeAll();
+    if (root.existsSync()) await root.delete(recursive: true);
+  });
+
+  group('basic operations', () {
+    test('put, get and delete', () async {
+      await db.put('user:1', <String, dynamic>{'name': 'Ada', 'age': 36});
+      final Object? user = await db.get('user:1');
+      expect(user, isA<Map<String, dynamic>>());
+      expect((user as Map<String, dynamic>)['name'], 'Ada');
+
+      expect(await db.exists('user:1'), isTrue);
+      await db.delete('user:1');
+      expect(await db.get('user:1'), isNull);
+      expect(await db.exists('user:1'), isFalse);
     });
-    
-    tearDown(() async {
-      // Close database
-      await db.close();
-      
-      // Clean up test directory
-      if (testDir.existsSync()) {
-        testDir.deleteSync(recursive: true);
-      }
+
+    test('stores primitives as well as documents', () async {
+      await db.put('count', 7);
+      await db.put('ratio', 0.5);
+      await db.put('flag', true);
+      await db.put('label', 'text');
+      await db.put('items', <dynamic>[1, 2, 3]);
+
+      expect(await db.get('count'), 7);
+      expect(await db.get('ratio'), 0.5);
+      expect(await db.get('flag'), true);
+      expect(await db.get('label'), 'text');
+      expect(await db.get('items'), <dynamic>[1, 2, 3]);
     });
-    
-    group('Basic Operations', () {
-      test('should store and retrieve string values', () async {
-        await db.put('key1', 'value1');
-        final value = await db.get('key1');
-        expect(value, equals('value1'));
+
+    test('putAll and deleteAll', () async {
+      await db.putAll(<String, Object?>{
+        'user:1': <String, dynamic>{'name': 'Ada'},
+        'user:2': <String, dynamic>{'name': 'Bob'},
+        'user:3': <String, dynamic>{'name': 'Cy'},
       });
-      
-      test('should store and retrieve numeric values', () async {
-        await db.put('int_key', 42);
-        await db.put('double_key', 3.14);
-        
-        expect(await db.get('int_key'), equals(42));
-        expect(await db.get('double_key'), equals(3.14));
-      });
-      
-      test('should store and retrieve boolean values', () async {
-        await db.put('bool_key', true);
-        expect(await db.get('bool_key'), equals(true));
-      });
-      
-      test('should store and retrieve Map objects', () async {
-        final user = {
-          'name': 'Alice',
-          'age': 30,
-          'email': 'alice@example.com',
-          'premium': true,
-        };
-        
-        await db.put('user:1', user);
-        final retrieved = await db.get('user:1');
-        
-        expect(retrieved, equals(user));
-        expect(retrieved['name'], equals('Alice'));
-        expect(retrieved['age'], equals(30));
-      });
-      
-      test('should store and retrieve List objects', () async {
-        final tags = ['flutter', 'dart', 'reaxdb'];
-        await db.put('tags', tags);
-        
-        final retrieved = await db.get('tags');
-        expect(retrieved, equals(tags));
-        expect(retrieved.length, equals(3));
-      });
-      
-      test('should return null for non-existent keys', () async {
-        final value = await db.get('non_existent');
-        expect(value, isNull);
-      });
-      
-      test('should delete values', () async {
-        await db.put('to_delete', 'value');
-        expect(await db.get('to_delete'), equals('value'));
-        
-        await db.delete('to_delete');
-        expect(await db.get('to_delete'), isNull);
-      });
-      
-      test('should check key existence', () async {
-        await db.put('exists', 'yes');
-        
-        expect(await db.exists('exists'), isTrue);
-        expect(await db.exists('not_exists'), isFalse);
-      });
+      expect(await db.count('user:*'), 3);
+      await db.deleteAll(<String>['user:1', 'user:2']);
+      expect(await db.count('user:*'), 1);
     });
-    
-    group('Batch Operations', () {
-      test('should perform batch put operations', () async {
-        final items = {
-          'item:1': {'name': 'Item 1', 'value': 100},
-          'item:2': {'name': 'Item 2', 'value': 200},
-          'item:3': {'name': 'Item 3', 'value': 300},
-        };
-        
-        await db.putAll(items);
-        
-        for (final entry in items.entries) {
-          final retrieved = await db.get(entry.key);
-          expect(retrieved, equals(entry.value));
-        }
-      });
-      
-      test('should perform batch delete operations', () async {
-        // Setup
-        await db.putAll({
-          'del:1': 'value1',
-          'del:2': 'value2',
-          'del:3': 'value3',
-          'keep:1': 'keeper',
-        });
-        
-        // Delete batch
-        await db.deleteAll(['del:1', 'del:2', 'del:3']);
-        
-        // Verify
-        expect(await db.get('del:1'), isNull);
-        expect(await db.get('del:2'), isNull);
-        expect(await db.get('del:3'), isNull);
-        expect(await db.get('keep:1'), equals('keeper'));
-      });
-    });
-    
-    group('Query Operations', () {
-      setUp(() async {
-        // Add test data
-        await db.putAll({
-          'user:1': {'name': 'Alice', 'age': 25},
-          'user:2': {'name': 'Bob', 'age': 30},
-          'user:3': {'name': 'Charlie', 'age': 35},
-          'product:1': {'name': 'Laptop', 'price': 999},
-          'product:2': {'name': 'Mouse', 'price': 29},
-          'setting:theme': 'dark',
-          'setting:lang': 'en',
-        });
-      });
-      
-      test('should query keys by pattern', () async {
-        final userKeys = await db.query('user:*');
-        expect(userKeys.length, equals(3));
-        expect(userKeys, contains('user:1'));
-        expect(userKeys, contains('user:2'));
-        expect(userKeys, contains('user:3'));
-        
-        final productKeys = await db.query('product:*');
-        expect(productKeys.length, equals(2));
-        
-        final settingKeys = await db.query('setting:*');
-        expect(settingKeys.length, equals(2));
-      });
-      
-      test('should get all values by pattern', () async {
-        final users = await db.getAll('user:*');
-        expect(users.length, equals(3));
-        expect(users['user:1']['name'], equals('Alice'));
-        expect(users['user:2']['name'], equals('Bob'));
-        expect(users['user:3']['name'], equals('Charlie'));
-      });
-      
-      test('should count keys by pattern', () async {
-        expect(await db.count('user:*'), equals(3));
-        expect(await db.count('product:*'), equals(2));
-        expect(await db.count('setting:*'), equals(2));
-        expect(await db.count('*'), equals(7));
-        expect(await db.count('nonexistent:*'), equals(0));
-      });
-      
-      test('should query all keys with wildcard', () async {
-        final allKeys = await db.query('*');
-        expect(allKeys.length, equals(7));
-      });
-    });
-    
-    group('Clear Operation', () {
-      test('should clear all data', () async {
-        // Add data
-        await db.putAll({
-          'key1': 'value1',
-          'key2': 'value2',
-          'key3': 'value3',
-        });
-        
-        expect(await db.count('*'), equals(3));
-        
-        // Clear
-        await db.clear();
-        
-        // Verify
-        expect(await db.count('*'), equals(0));
-        expect(await db.get('key1'), isNull);
-        expect(await db.get('key2'), isNull);
-        expect(await db.get('key3'), isNull);
-      });
-    });
-    
-    group('Real-time Watching', () {
-      test('should watch all changes', () async {
-        final events = <DatabaseChangeEvent>[];
-        final subscription = db.watch().listen(events.add);
-        
-        // Make changes
-        await db.put('watch:1', 'value1');
-        await db.put('watch:2', 'value2');
-        await db.delete('watch:1');
-        
-        // Wait for events to propagate
-        await Future.delayed(Duration(milliseconds: 100));
-        
-        // Verify events
-        expect(events.length, greaterThanOrEqualTo(3));
-        
-        subscription.cancel();
-      });
-      
-      test('should watch specific pattern', () async {
-        final events = <DatabaseChangeEvent>[];
-        final subscription = db.watch('user:*').listen(events.add);
-        
-        // Make changes
-        await db.put('user:new', {'name': 'David'});
-        await db.put('product:new', {'name': 'Keyboard'}); // Should not trigger
-        
-        // Wait for events
-        await Future.delayed(Duration(milliseconds: 100));
-        
-        // Verify only user events are received
-        expect(events.length, equals(1));
-        expect(events.first.key, equals('user:new'));
-        
-        subscription.cancel();
-      });
-    });
-    
-    group('Database Info', () {
-      test('should return database information', () async {
-        await db.putAll({
-          'test:1': 'value1',
-          'test:2': 'value2',
-        });
-        
-        final info = await db.info();
-        
-        expect(info.name, isNotNull);
-        expect(info.entryCount, greaterThanOrEqualTo(2));
-        expect(info.sizeBytes, greaterThanOrEqualTo(0)); // Can be 0 if not yet persisted
-      });
-    });
-    
-    group('Advanced API Access', () {
-      test('should provide access to advanced API', () async {
-        // The advanced property should return the full ReaxDB instance
-        expect(db.advanced, isA<ReaxDB>());
-        
-        // Should be able to use advanced features
-        await db.advanced.transaction((txn) async {
-          await txn.put('txn:1', 'value1');
-          await txn.put('txn:2', 'value2');
-        });
-        
-        expect(await db.get('txn:1'), equals('value1'));
-        expect(await db.get('txn:2'), equals('value2'));
-      });
-    });
-    
-    group('Encryption', () {
-      test('should create encrypted database', () async {
-        final encryptedDb = await ReaxDB.simple(
-          'encrypted_test',
-          encrypted: true,
-          path: 'test_encrypted',
-        );
-        
-        await encryptedDb.put('secret', 'my secret data');
-        expect(await encryptedDb.get('secret'), equals('my secret data'));
-        
-        await encryptedDb.close();
-        
-        // Clean up
-        Directory('test_encrypted').deleteSync(recursive: true);
-      });
-    });
-    
-    group('Edge Cases', () {
-      test('should handle empty string keys', () async {
-        await db.put('', 'empty key value');
-        expect(await db.get(''), equals('empty key value'));
-      });
-      
-      test('should handle special characters in keys', () async {
-        final specialKey = 'key:with/special@chars#123';
-        await db.put(specialKey, 'special value');
-        expect(await db.get(specialKey), equals('special value'));
-      });
-      
-      test('should handle large values', () async {
-        final largeList = List.generate(10000, (i) => 'item_$i');
-        await db.put('large_list', largeList);
-        
-        final retrieved = await db.get('large_list');
-        expect(retrieved.length, equals(10000));
-        expect(retrieved[0], equals('item_0'));
-        expect(retrieved[9999], equals('item_9999'));
-      });
-      
-      test('should handle null values in maps', () async {
-        final data = {
-          'name': 'Test',
-          'optional': null,
-          'nested': {
-            'value': 123,
-            'nullField': null,
-          }
-        };
-        
-        await db.put('nullable', data);
-        final retrieved = await db.get('nullable');
-        
-        expect(retrieved['name'], equals('Test'));
-        expect(retrieved['optional'], isNull);
-        expect(retrieved['nested']['value'], equals(123));
-        expect(retrieved['nested']['nullField'], isNull);
-      });
-      
-      test('should overwrite existing values', () async {
-        await db.put('key', 'original');
-        expect(await db.get('key'), equals('original'));
-        
-        await db.put('key', 'updated');
-        expect(await db.get('key'), equals('updated'));
-        
-        await db.put('key', {'complex': 'object'});
-        expect(await db.get('key'), equals({'complex': 'object'}));
-      });
-    });
-    
-    group('Performance', () {
-      test('should handle rapid sequential operations', () async {
-        final stopwatch = Stopwatch()..start();
-        
-        for (int i = 0; i < 1000; i++) {
-          await db.put('perf:$i', {'index': i, 'data': 'test_$i'});
-        }
-        
-        stopwatch.stop();
-        print('1000 sequential puts: ${stopwatch.elapsedMilliseconds}ms');
-        
-        expect(await db.count('perf:*'), equals(1000));
-        expect(stopwatch.elapsedMilliseconds, lessThan(5000)); // Should be fast
-      });
-      
-      test('should handle batch operations efficiently', () async {
-        final items = <String, dynamic>{};
-        for (int i = 0; i < 1000; i++) {
-          items['batch:$i'] = {'index': i, 'data': 'test_$i'};
-        }
-        
-        final stopwatch = Stopwatch()..start();
-        await db.putAll(items);
-        stopwatch.stop();
-        
-        print('Batch put of 1000 items: ${stopwatch.elapsedMilliseconds}ms');
-        
-        expect(await db.count('batch:*'), equals(1000));
-        expect(stopwatch.elapsedMilliseconds, lessThan(1000)); // Batch should be faster
-      });
+
+    test('TTL entries expire', () async {
+      await db.put('session', 'token', ttl: const Duration(milliseconds: 30));
+      expect(await db.get('session'), 'token');
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+      expect(await db.get('session'), isNull);
     });
   });
-  
-  group('SimpleReaxDB Static Methods', () {
-    test('should create database with quickStart method', () async {
-      final db = await ReaxDB.quickStart('quickstart_test');
-      
-      await db.put('test', 'value');
-      expect(await db.get('test'), equals('value'));
-      
-      await db.close();
-      Directory('quickstart_test').deleteSync(recursive: true);
+
+  group('iteration without a key registry', () {
+    setUp(() async {
+      await db.putAll(<String, Object?>{
+        'user:1': <String, dynamic>{'name': 'Ada'},
+        'user:2': <String, dynamic>{'name': 'Bob'},
+        'settings:theme': 'dark',
+        'counter': 1,
+      });
+    });
+
+    test('query returns keys matching a prefix pattern', () async {
+      expect((await db.query('user:*'))..sort(), <String>['user:1', 'user:2']);
+      expect(await db.query('settings:*'), <String>['settings:theme']);
+    });
+
+    test('query with * returns every key', () async {
+      expect(await db.count(), 4);
+      expect((await db.query('*')).length, 4);
+    });
+
+    test('query with an exact key', () async {
+      expect(await db.query('counter'), <String>['counter']);
+      expect(await db.query('missing'), isEmpty);
+    });
+
+    test('getAll returns key/value pairs', () async {
+      final Map<String, Object?> users = await db.getAll('user:*');
+      expect(users.keys.toList()..sort(), <String>['user:1', 'user:2']);
+      expect((users['user:1']! as Map<String, dynamic>)['name'], 'Ada');
+    });
+
+    test(
+      'keys written by another instance are visible after a reopen',
+      () async {
+        await db.close();
+        final SimpleReaxDB reopened = await ReaxDB.simple(
+          'myapp',
+          path: '${root.path}/myapp',
+        );
+        expect(await reopened.count(), 4);
+        expect((await reopened.query('user:*')).length, 2);
+        await reopened.close();
+      },
+    );
+
+    test('clear removes everything', () async {
+      await db.clear();
+      expect(await db.count(), 0);
+      expect(await db.get('counter'), isNull);
+    });
+  });
+
+  group('watching', () {
+    test('watch emits change events', () async {
+      final List<DatabaseChangeEvent> seen = <DatabaseChangeEvent>[];
+      final subscription = db.watch('user:*').listen(seen.add);
+      await Future<void>.delayed(Duration.zero);
+      await db.put('user:1', <String, dynamic>{'name': 'Ada'});
+      await db.put('other', 1);
+      await Future<void>.delayed(Duration.zero);
+      await subscription.cancel();
+      expect(seen, hasLength(1));
+      expect(seen.single.key, 'user:1');
+    });
+  });
+
+  group('security', () {
+    test('a simple database is not encrypted by default', () async {
+      expect(db.advanced.encryptionInfo['enabled'], isFalse);
+    });
+
+    test('encryption requires real key material, never the name', () async {
+      final SimpleReaxDB encrypted = await ReaxDB.simple(
+        'secure',
+        path: '${root.path}/secure',
+        encryption: EncryptionConfig.aes256FromPassphrase(
+          passphrase: 'a strong passphrase',
+          iterations: 1000,
+        ),
+      );
+      await encrypted.put('secret', 'value');
+      expect(encrypted.advanced.encryptionInfo['type'], 'aes256');
+      expect(encrypted.advanced.encryptionInfo['is_authenticated'], isTrue);
+      await encrypted.close();
+
+      // The same database name with no passphrase cannot read the data.
+      expect(
+        () => ReaxDB.simple('secure', path: '${root.path}/secure'),
+        throwsA(isA<EncryptionException>()),
+      );
+    });
+  });
+
+  group('advanced escape hatch', () {
+    test('advanced exposes the full API', () async {
+      await db.advanced.createIndex('user', <String>['name']);
+      await db.putAll(<String, Object?>{
+        'user:1': <String, dynamic>{'name': 'Ada'},
+        'user:2': <String, dynamic>{'name': 'Bob'},
+      });
+      final List<Map<String, dynamic>> found =
+          await db.advanced.query('user').whereEquals('name', 'Ada').find();
+      expect(found, hasLength(1));
+
+      await db.advanced.transaction<void>(
+        (ReaxTransaction tx) =>
+            tx.put('user:3', <String, dynamic>{'name': 'Cy'}),
+      );
+      expect(await db.count('user:*'), 3);
+    });
+
+    test('info reports the real path and entry count', () async {
+      await db.put('a', 1);
+      final DatabaseInfo info = await db.info();
+      expect(info.entryCount, 1);
+      expect(Directory(info.path).existsSync(), isTrue);
     });
   });
 }

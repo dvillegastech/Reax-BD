@@ -1,87 +1,153 @@
 import 'dart:io';
-import 'package:test/test.dart';
+
 import 'package:reaxdb_dart/reaxdb_dart.dart';
+import 'package:test/test.dart';
 
 void main() {
-  group('Transaction API Test', () {
-    late String testDbPath;
+  late Directory root;
+  late ReaxDB db;
 
-    setUp(() {
-      testDbPath = '${Directory.systemTemp.path}/reaxdb_transaction_api_test_${DateTime.now().millisecondsSinceEpoch}';
+  setUp(() async {
+    root = await Directory.systemTemp.createTemp('reaxdb_tx_');
+    db = await ReaxDB.open(path: '${root.path}/db');
+  });
+
+  tearDown(() async {
+    await ReaxDB.closeAll();
+    if (root.existsSync()) await root.delete(recursive: true);
+  });
+
+  test('a committed transaction applies every write', () async {
+    await db.transaction<void>((ReaxTransaction tx) async {
+      await tx.put('account:1', <String, dynamic>{'balance': 100});
+      await tx.put('account:2', <String, dynamic>{'balance': 200});
     });
 
-    tearDown(() async {
-      // Clean up test database
-      final dir = Directory(testDbPath);
-      if (await dir.exists()) {
-        await dir.delete(recursive: true);
-      }
+    expect((await db.get<Map<String, dynamic>>('account:1'))!['balance'], 100);
+    expect((await db.get<Map<String, dynamic>>('account:2'))!['balance'], 200);
+  });
+
+  test('a failing transaction applies nothing', () async {
+    await db.put('account:1', <String, dynamic>{'balance': 100});
+    await expectLater(
+      db.transaction<void>((ReaxTransaction tx) async {
+        await tx.put('account:1', <String, dynamic>{'balance': 0});
+        await tx.put('account:2', <String, dynamic>{'balance': 999});
+        throw StateError('rollback');
+      }),
+      throwsA(isA<StateError>()),
+    );
+
+    expect((await db.get<Map<String, dynamic>>('account:1'))!['balance'], 100);
+    expect(await db.get<Map<String, dynamic>>('account:2'), isNull);
+  });
+
+  test('reads observe the transaction own writes', () async {
+    final int result = await db.transaction<int>((ReaxTransaction tx) async {
+      await tx.put('counter', 5);
+      return (await tx.get<int>('counter'))! + 1;
     });
+    expect(result, 6);
+    expect(await db.get<int>('counter'), 5);
+  });
 
-    test('Transaction example from email should work correctly', () async {
-      final db = await ReaxDB.open(testDbPath);
+  test('transactional deletes are applied', () async {
+    await db.put('gone', 'value');
+    await db.transaction<void>((ReaxTransaction tx) => tx.delete('gone'));
+    expect(await db.get<String>('gone'), isNull);
+  });
 
-      // Use transaction() with a callback - commits automatically on success
-      await db.transaction((txn) async {
-        await txn.put('account:1', {'balance': 1000});
-        await txn.put('account:2', {'balance': 500});
+  test('a transaction returns a typed value', () async {
+    final String name = await db.transaction<String>((
+      ReaxTransaction tx,
+    ) async {
+      await tx.put('user:1', <String, dynamic>{'name': 'Ada'});
+      final Map<String, dynamic>? user = await tx.get<Map<String, dynamic>>(
+        'user:1',
+      );
+      return user!['name'] as String;
+    });
+    expect(name, 'Ada');
+  });
 
-        // Transfer money
-        final account1 = await txn.get('account:1');
-        final account2 = await txn.get('account:2');
+  test('committed writes update the cache and emit change events', () async {
+    final List<DatabaseChangeEvent> seen = <DatabaseChangeEvent>[];
+    final subscription = db.watch('tx:*').listen(seen.add);
+    await Future<void>.delayed(Duration.zero);
 
-        expect(account1, isNotNull);
-        expect(account2, isNotNull);
-        expect(account1!['balance'], equals(1000));
-        expect(account2!['balance'], equals(500));
+    await db.transaction<void>((ReaxTransaction tx) async {
+      await tx.put('tx:a', 1);
+      await tx.put('tx:b', 2);
+    });
+    await Future<void>.delayed(Duration.zero);
+    await subscription.cancel();
 
-        await txn.put('account:1', {'balance': account1['balance'] - 100});
-        await txn.put('account:2', {'balance': account2['balance'] + 100});
-        
-        // No need to manually commit - happens automatically
-        // If an exception is thrown, automatic rollback occurs
+    expect(
+      seen.map((DatabaseChangeEvent e) => e.key).toList()..sort(),
+      <String>['tx:a', 'tx:b'],
+    );
+    expect(
+      seen.every((DatabaseChangeEvent e) => e.type == ChangeType.put),
+      isTrue,
+    );
+    expect(await db.get<int>('tx:a'), 1);
+  });
+
+  test('committed writes maintain secondary indexes', () async {
+    await db.createIndex('people', <String>['city']);
+    await db.transaction<void>((ReaxTransaction tx) async {
+      await tx.put('people:1', <String, dynamic>{
+        'name': 'Ada',
+        'city': 'Oslo',
       });
-
-      // Verify the transaction was committed
-      final finalAccount1 = await db.get('account:1');
-      final finalAccount2 = await db.get('account:2');
-
-      expect(finalAccount1, isNotNull);
-      expect(finalAccount2, isNotNull);
-      expect(finalAccount1!['balance'], equals(900));
-      expect(finalAccount2!['balance'], equals(600));
-
-      await db.close();
     });
+    expect(
+      await db.query('people').whereEquals('city', 'Oslo').find(),
+      hasLength(1),
+    );
 
-    test('Transaction should rollback on error', () async {
-      final db = await ReaxDB.open(testDbPath);
+    await db.transaction<void>((ReaxTransaction tx) => tx.delete('people:1'));
+    expect(
+      await db.query('people').whereEquals('city', 'Oslo').find(),
+      isEmpty,
+    );
+  });
 
-      // First, set up initial data
-      await db.put('account:1', {'balance': 1000});
-      await db.put('account:2', {'balance': 500});
+  test('transactional writes honor TTL', () async {
+    await db.transaction<void>(
+      (ReaxTransaction tx) =>
+          tx.put('temp', 'v', ttl: const Duration(milliseconds: 30)),
+    );
+    expect(await db.get<String>('temp'), 'v');
+    await Future<void>.delayed(const Duration(milliseconds: 60));
+    expect(await db.get<String>('temp'), isNull);
+  });
 
-      // Try a transaction that will fail
-      try {
-        await db.transaction((txn) async {
-          await txn.put('account:1', {'balance': 900});
-          await txn.put('account:2', {'balance': 600});
-          
-          // Force an error
-          throw Exception('Simulated error');
-        });
-      } catch (e) {
-        // Expected error
-      }
+  test('serializable transactions detect a conflicting write', () async {
+    await db.put('shared', 1);
+    await expectLater(
+      db.transaction<void>(
+        (ReaxTransaction tx) async {
+          await tx.get<int>('shared');
+          // A concurrent committed write invalidates the read set.
+          await db.put('shared', 2);
+          await tx.put('other', 3);
+        },
+        isolationLevel: IsolationLevel.serializable,
+        maxAttempts: 1,
+      ),
+      throwsA(isA<TransactionConflictException>()),
+    );
+    expect(await db.get<int>('other'), isNull);
+  });
 
-      // Verify the transaction was rolled back
-      final account1 = await db.get('account:1');
-      final account2 = await db.get('account:2');
-
-      expect(account1!['balance'], equals(1000)); // Should be unchanged
-      expect(account2!['balance'], equals(500));  // Should be unchanged
-
-      await db.close();
-    });
+  test('concurrent transactions on distinct keys all commit', () async {
+    await Future.wait(<Future<void>>[
+      for (int i = 0; i < 20; i++)
+        db.transaction<void>((ReaxTransaction tx) => tx.put('c:$i', i)),
+    ]);
+    for (int i = 0; i < 20; i++) {
+      expect(await db.get<int>('c:$i'), i);
+    }
   });
 }

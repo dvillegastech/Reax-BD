@@ -1,164 +1,104 @@
-/// Represents a database entry
-class DatabaseEntry {
+/// Public value types describing database entries, events and statistics.
+///
+/// Every `toString()` here is REDACTED: keys are reduced to a non-reversible
+/// fingerprint and values to a type/size description. These objects routinely
+/// end up in log lines, exception messages and debugger output, and a
+/// database entry is by definition user data.
+library;
+
+import '../../core/logging/redaction.dart';
+
+/// A key/value pair read from the database.
+///
+/// [value] is already decoded to the requested type; [expiresAt] is the
+/// absolute expiry instant of the entry, or null when it never expires.
+final class ReaxEntry<T> {
+  /// Creates an entry.
+  const ReaxEntry({required this.key, required this.value, this.expiresAt});
+
+  /// The entry key.
   final String key;
-  final dynamic value;
-  final DateTime createdAt;
-  final DateTime updatedAt;
-  final int version;
 
-  const DatabaseEntry({
-    required this.key,
-    required this.value,
-    required this.createdAt,
-    required this.updatedAt,
-    required this.version,
-  });
+  /// The decoded value.
+  final T value;
 
-  DatabaseEntry copyWith({
-    String? key,
-    dynamic value,
-    DateTime? createdAt,
-    DateTime? updatedAt,
-    int? version,
-  }) {
-    return DatabaseEntry(
-      key: key ?? this.key,
-      value: value ?? this.value,
-      createdAt: createdAt ?? this.createdAt,
-      updatedAt: updatedAt ?? this.updatedAt,
-      version: version ?? this.version,
-    );
-  }
+  /// When the entry expires, or null when it does not.
+  final DateTime? expiresAt;
 
   @override
-  bool operator ==(Object other) {
-    if (identical(this, other)) return true;
-    return other is DatabaseEntry &&
-        other.key == key &&
-        other.value == value &&
-        other.version == version;
-  }
+  bool operator ==(Object other) =>
+      other is ReaxEntry<T> &&
+      other.key == key &&
+      other.value == value &&
+      other.expiresAt == expiresAt;
 
   @override
-  int get hashCode {
-    return key.hashCode ^ value.hashCode ^ version.hashCode;
-  }
+  int get hashCode => Object.hash(key, value, expiresAt);
 
+  /// Redacted description: never includes the key or value content.
   @override
-  String toString() {
-    return 'DatabaseEntry(key: $key, value: $value, version: $version)';
-  }
+  String toString() =>
+      'ReaxEntry(${Redaction.key(key)}, ${Redaction.value(value)}'
+      '${expiresAt == null ? '' : ', expiresAt: $expiresAt'})';
 }
 
-/// Database state information
-class DatabaseInfo {
-  final String name;
-  final String path;
-  final DateTime createdAt;
-  final DateTime lastAccessed;
-  final int entryCount;
-  final int sizeBytes;
-  final bool isEncrypted;
-
+/// Point-in-time description of an open database.
+final class DatabaseInfo {
+  /// Creates a database description.
   const DatabaseInfo({
-    required this.name,
     required this.path,
-    required this.createdAt,
-    required this.lastAccessed,
+    required this.schemaVersion,
+    required this.syncMode,
+    required this.encryptionType,
     required this.entryCount,
     required this.sizeBytes,
-    required this.isEncrypted,
+    required this.indexCount,
   });
+
+  /// Absolute path of the database directory.
+  final String path;
+
+  /// Schema version currently recorded in the database header.
+  final int schemaVersion;
+
+  /// Name of the effective default sync mode.
+  final String syncMode;
+
+  /// Name of the effective encryption algorithm.
+  final String encryptionType;
+
+  /// Number of live user entries (index postings excluded).
+  final int entryCount;
+
+  /// Total bytes of SSTable data on disk.
+  final int sizeBytes;
+
+  /// Number of secondary indexes defined.
+  final int indexCount;
 
   @override
-  String toString() {
-    return 'DatabaseInfo(name: $name, entries: $entryCount, size: ${(sizeBytes / 1024).toStringAsFixed(1)}KB)';
-  }
+  String toString() =>
+      'DatabaseInfo(path: $path, schemaVersion: $schemaVersion, '
+      'entries: $entryCount, size: ${(sizeBytes / 1024).toStringAsFixed(1)}KB, '
+      'sync: $syncMode, encryption: $encryptionType, indexes: $indexCount)';
 }
 
-/// Storage engine configuration
-class StorageConfig {
-  final int memtableSize;
-  final int pageSize;
-  final bool compressionEnabled;
-  final bool syncWrites;
-  final int maxImmutableMemtables;
+/// The kind of change described by a [DatabaseChangeEvent].
+enum ChangeType {
+  /// A key was inserted or overwritten.
+  put,
 
-  const StorageConfig({
-    required this.memtableSize,
-    required this.pageSize,
-    required this.compressionEnabled,
-    required this.syncWrites,
-    required this.maxImmutableMemtables,
-  });
-
-  factory StorageConfig.defaultConfig() => const StorageConfig(
-    memtableSize: 4 * 1024 * 1024, // 4MB
-    pageSize: 4096, // 4KB
-    compressionEnabled: true,
-    syncWrites: true,
-    maxImmutableMemtables: 4,
-  );
+  /// A key was removed, either explicitly or because its TTL elapsed.
+  delete,
 }
 
-/// Cache statistics
-class CacheStats {
-  final int l1Hits;
-  final int l1Misses;
-  final int l2Hits;
-  final int l2Misses;
-  final int l3Hits;
-  final int l3Misses;
-  final int totalEntries;
-  final double hitRatio;
-
-  const CacheStats({
-    required this.l1Hits,
-    required this.l1Misses,
-    required this.l2Hits,
-    required this.l2Misses,
-    required this.l3Hits,
-    required this.l3Misses,
-    required this.totalEntries,
-    required this.hitRatio,
-  });
-
-  @override
-  String toString() {
-    return 'CacheStats(entries: $totalEntries, hitRatio: ${(hitRatio * 100).toStringAsFixed(1)}%)';
-  }
-}
-
-/// Transaction statistics
-class TransactionStats {
-  final int activeTransactions;
-  final int committedTransactions;
-  final int abortedTransactions;
-  final double averageTransactionTime;
-
-  const TransactionStats({
-    required this.activeTransactions,
-    required this.committedTransactions,
-    required this.abortedTransactions,
-    required this.averageTransactionTime,
-  });
-
-  @override
-  String toString() {
-    return 'TransactionStats(active: $activeTransactions, committed: $committedTransactions, aborted: $abortedTransactions)';
-  }
-}
-
-/// Type of database change
-enum ChangeType { put, delete, update }
-
-/// Database change event
-class DatabaseChangeEvent {
-  final ChangeType type;
-  final String key;
-  final dynamic value;
-  final DateTime timestamp;
-
+/// A change applied to the database, delivered after its durability point.
+///
+/// Events are published only once the mutation is durable per the effective
+/// sync mode, so an observer that sees an event can rely on the write having
+/// been acknowledged.
+final class DatabaseChangeEvent {
+  /// Creates a change event.
   const DatabaseChangeEvent({
     required this.type,
     required this.key,
@@ -166,8 +106,21 @@ class DatabaseChangeEvent {
     required this.timestamp,
   });
 
+  /// Whether the key was written or removed.
+  final ChangeType type;
+
+  /// The key that changed.
+  final String key;
+
+  /// The new value for a [ChangeType.put], null for a delete.
+  final Object? value;
+
+  /// When the change was published.
+  final DateTime timestamp;
+
+  /// Redacted description: never includes the key or value content.
   @override
-  String toString() {
-    return 'DatabaseChangeEvent(type: $type, key: $key, timestamp: $timestamp)';
-  }
+  String toString() =>
+      'DatabaseChangeEvent(${type.name}, ${Redaction.key(key)}, '
+      '${Redaction.value(value)}, at: ${timestamp.toIso8601String()})';
 }
